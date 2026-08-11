@@ -1,0 +1,7 @@
+build
+vscode/*
+.claude/*
+.agents/*
+.devcontainer/*
+git_ignore/*
+managed_components/*
