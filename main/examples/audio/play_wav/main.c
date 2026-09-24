@@ -1,47 +1,33 @@
 /*
- * ESP32-P4 Audio Playback Example
- * Codec: ES8389 (DAC mode)
- * Speaker amplifier: controlled by XL9555_SPK_CRTL
- * Plays embedded WAV file (sample-3s.wav)
+ * ESP32-P4 WAV playback example.
+ * Board resources and the ES8389 playback path are initialized by the BSP
+ * and audio_codec components.
  */
 
-#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
-#include "sdkconfig.h"
-#include "esp_log.h"
+
 #include "esp_err.h"
-#include "esp_check.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
+#include "t_panel_audio_codec.h"
+#include "t_panel_p4_bsp.h"
 
-#include "driver/i2c_master.h"
-#include "driver/i2s_std.h"
-#include "esp_codec_dev.h"
-#include "esp_codec_dev_defaults.h"
-#include "es8389_codec.h"
-#include "esp_io_expander.h"
-#include "esp_io_expander_xl9555.h"
+static const char *TAG = "audio_play_wav";
 
-#include "esp_heap_caps.h"
-#include "T_Panle_P4_board_config.h"
+#define AUDIO_OUTPUT_VOLUME 100
+#define PLAYBACK_CHUNK_SIZE 1024
+#define SOFTWARE_GAIN       1.0f
 
-static const char *TAG = "audio_example";
-
-#define I2C_NUM (0)
-#define I2S_NUM (0)
-#define AUDIO_SAMPLE_RATE (44100)
-#define AUDIO_BITS_PER_SAMPLE (16)
-#define AUDIO_CHANNELS (2)
-
-#define ES8389_I2C_ADDR ES8389_CODEC_DEFAULT_ADDR
-
-// WAV file header structure
-typedef struct __attribute__((packed))
-{
-    char riff_tag[4]; // "RIFF"
+typedef struct __attribute__((packed)) {
+    char riff_tag[4];
     uint32_t file_size;
-    char wave_tag[4]; // "WAVE"
-    char fmt_tag[4];  // "fmt "
+    char wave_tag[4];
+    char fmt_tag[4];
     uint32_t fmt_size;
     uint16_t audio_format;
     uint16_t num_channels;
@@ -51,254 +37,150 @@ typedef struct __attribute__((packed))
     uint16_t bits_per_sample;
 } wav_header_t;
 
-// Embed the WAV file into flash
 extern const uint8_t wav_start[] asm("_binary_sample_3s_wav_start");
 extern const uint8_t wav_end[] asm("_binary_sample_3s_wav_end");
-const uint8_t *pcm_data;
-size_t pcm_size;
-i2s_chan_handle_t tx_handle = NULL;
-static esp_codec_dev_handle_t play_dev = NULL;
 
-static void i2s_music(void *args);
-
-static esp_err_t init_i2c(i2c_master_bus_handle_t *bus_handle)
-{
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    return i2c_new_master_bus(&bus_cfg, bus_handle);
-}
-
-static esp_err_t init_xl9555_spk(i2c_master_bus_handle_t bus_handle)
-{
-    esp_io_expander_handle_t expander = NULL;
-    ESP_RETURN_ON_ERROR(esp_io_expander_new_i2c_xl9555(bus_handle, XL9555_I2C_ADDR, &expander),
-                        TAG, "XL9555 init failed");
-
-    ESP_RETURN_ON_ERROR(esp_io_expander_set_dir(expander, 1 << XL9555_SPK_CRTL, IO_EXPANDER_OUTPUT),
-                        TAG, "Set SPK pin direction failed");
-    ESP_RETURN_ON_ERROR(esp_io_expander_set_level(expander, 1 << XL9555_SPK_CRTL, 1),
-                        TAG, "Set SPK pin level failed");
-
-    ESP_LOGI(TAG, "Speaker amplifier enabled");
-    return ESP_OK;
-}
-
-static esp_err_t init_i2s(i2s_chan_handle_t *tx_handle)
-{
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
-    chan_cfg.auto_clear = true;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, tx_handle, NULL), TAG, "I2S new channel failed");
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_MCK_PIN,
-            .bclk = I2S_BCK_PIN,
-            .ws = I2S_WS_PIN,
-            .dout = I2S_DO_PIN,
-            .din = I2S_DI_PIN,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv = false,
-            },
-        },
-    };
-    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
-
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(*tx_handle, &std_cfg), TAG, "I2S init std mode failed");
-
-    ESP_LOGI(TAG, "I2S initialized: %d Hz, %d-bit, %d ch",
-             AUDIO_SAMPLE_RATE, AUDIO_BITS_PER_SAMPLE, AUDIO_CHANNELS);
-    return ESP_OK;
-}
-
-static esp_err_t init_codec(i2c_master_bus_handle_t bus_handle, i2s_chan_handle_t tx_handle)
-{
-    audio_codec_i2c_cfg_t i2c_cfg = {
-        .addr = ES8389_I2C_ADDR,
-        .bus_handle = bus_handle,
-    };
-    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
-
-    audio_codec_i2s_cfg_t i2s_cfg = {
-        .port = I2S_NUM,
-        .tx_handle = tx_handle,
-        .rx_handle = NULL,
-    };
-    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg);
-
-    const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
-
-    es8389_codec_cfg_t codec_cfg = {
-        .ctrl_if = ctrl_if,
-        .gpio_if = gpio_if,
-        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
-        .pa_pin = -1,
-        .pa_reverted = false,
-        .master_mode = false,
-        .use_mclk = true,
-        .hw_gain = {
-            .pa_voltage = 0,
-            .codec_dac_voltage = 0,
-        },
-        .mclk_div = I2S_MCLK_MULTIPLE_384,
-    };
-    const audio_codec_if_t *codec_if = es8389_codec_new(&codec_cfg);
-    if (!codec_if)
-    {
-        ESP_LOGE(TAG, "ES8389 codec new failed");
-        return ESP_FAIL;
-    }
-
-    esp_codec_dev_cfg_t dev_cfg = {
-        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
-        .codec_if = codec_if,
-        .data_if = data_if,
-    };
-    play_dev = esp_codec_dev_new(&dev_cfg);
-    if (!play_dev)
-    {
-        ESP_LOGE(TAG, "Codec dev new failed");
-        return ESP_FAIL;
-    }
-
-    ESP_RETURN_ON_ERROR(esp_codec_dev_set_out_vol(play_dev, 80),
-                        TAG, "Set volume failed");
-
-    esp_codec_dev_sample_info_t fs = {
-        .bits_per_sample = AUDIO_BITS_PER_SAMPLE,
-        .channel = AUDIO_CHANNELS,
-        .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) | ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1),
-        .sample_rate = AUDIO_SAMPLE_RATE,
-        .mclk_multiple = I2S_MCLK_MULTIPLE_384,
-    };
-    ESP_RETURN_ON_ERROR(esp_codec_dev_open(play_dev, &fs),
-                        TAG, "Codec dev open failed");
-
-    ESP_LOGI(TAG, "ES8389 codec initialized (DAC mode, vol=80)");
-    return ESP_OK;
-}
+static t_panel_p4_bsp_t s_bsp;
+static t_panel_audio_codec_handle_t s_audio;
+static const uint8_t *s_pcm_data;
+static size_t s_pcm_size;
 
 static size_t find_data_chunk(const uint8_t *wav, size_t wav_size)
 {
-    size_t offset = 12; // skip RIFF header
-    while (offset + 8 < wav_size)
-    {
-        uint32_t chunk_size = *(uint32_t *)(wav + offset + 4);
-        if (memcmp(wav + offset, "data", 4) == 0)
-        {
+    size_t offset = 12;
+    while (offset + 8 <= wav_size) {
+        uint32_t chunk_size = 0;
+        memcpy(&chunk_size, wav + offset + 4, sizeof(chunk_size));
+        if (memcmp(wav + offset, "data", 4) == 0) {
             return offset + 8;
         }
-        offset += 8 + chunk_size;
+        if (chunk_size > wav_size - offset - 8) {
+            break;
+        }
+        offset += 8 + chunk_size + (chunk_size & 1U);
     }
     return 0;
 }
 
-void app_main(void)
+static int16_t apply_gain(int32_t sample, float gain)
 {
-    ESP_LOGI(TAG, "=== Audio Playback Test (WAV file) ===");
-    esp_log_level_set("ES8389", ESP_LOG_DEBUG);
-    esp_log_level_set("I2S_IF", ESP_LOG_DEBUG);
-    esp_log_level_set("Adev_Codec", ESP_LOG_DEBUG);
-
-    size_t wav_size = wav_end - wav_start;
-    ESP_LOGI(TAG, "WAV file size: %u bytes", (unsigned)wav_size);
-
-    // Parse WAV header
-    if (wav_size < sizeof(wav_header_t))
-    {
-        ESP_LOGE(TAG, "WAV file too small");
-        return;
+    int32_t value = (int32_t)(sample * gain);
+    if (value > INT16_MAX) {
+        value = INT16_MAX;
+    } else if (value < INT16_MIN) {
+        value = INT16_MIN;
     }
-    wav_header_t *hdr = (wav_header_t *)wav_start;
-    ESP_LOGI(TAG, "WAV: %d Hz, %d-bit, %d ch, format=%d",
-             hdr->sample_rate, hdr->bits_per_sample, hdr->num_channels, hdr->audio_format);
-
-    // Find PCM data offset
-    size_t data_offset = find_data_chunk(wav_start, wav_size);
-    if (data_offset == 0)
-    {
-        ESP_LOGE(TAG, "WAV data chunk not found");
-        return;
-    }
-    pcm_data = wav_start + data_offset;
-    pcm_size = wav_size - data_offset;
-    ESP_LOGI(TAG, "PCM data offset: %u, size: %u bytes", (unsigned)data_offset, (unsigned)pcm_size);
-
-    // Init peripherals
-    i2c_master_bus_handle_t bus_handle = NULL;
-    ESP_ERROR_CHECK(init_i2c(&bus_handle));
-    ESP_LOGI(TAG, "I2C bus initialized");
-
-    ESP_ERROR_CHECK(init_xl9555_spk(bus_handle));
-
-    ESP_ERROR_CHECK(init_i2s(&tx_handle));
-
-    ESP_ERROR_CHECK(init_codec(bus_handle, tx_handle));
-
-    xTaskCreate(i2s_music, "i2s_music", 4096, NULL, 5, NULL);
+    return (int16_t)value;
 }
 
-// Software gain multiplier (adjust this value: 1.0=no change, 4.0=~12dB boost)
-#define SOFTWARE_GAIN 1.0f
-
-static void amplify_pcm(const int16_t *src, int16_t *dst, size_t sample_count, float gain)
+static void prepare_pcm(const int16_t *src, int16_t *dst,
+                        size_t sample_count, float gain)
 {
-    for (size_t i = 0; i < sample_count; i++) {
-        int32_t val = (int32_t)(src[i] * gain);
-        if (val > 32767) val = 32767;
-        if (val < -32768) val = -32768;
-        dst[i] = (int16_t)val;
+#if CONFIG_T_PANEL_P4_BOARD_RECT
+    /* Rect uses the two DAC outputs as a differential mono speaker signal. */
+    for (size_t i = 0; i + 1 < sample_count; i += 2) {
+        const int32_t mono = ((int32_t)src[i] + src[i + 1]) / 2;
+        dst[i] = apply_gain(mono, gain);
+        dst[i + 1] = apply_gain(mono, gain);
     }
+#else
+    for (size_t i = 0; i < sample_count; ++i) {
+        dst[i] = apply_gain(src[i], gain);
+    }
+#endif
 }
 
-static void i2s_music(void *args)
+static void playback_task(void *args)
 {
-    const size_t chunk_size = 1024;
-    size_t offset = 0;
-    int loop_count = 0;
-
-    int16_t *amp_buf = heap_caps_malloc(chunk_size, MALLOC_CAP_DEFAULT);
-    if (!amp_buf) {
-        ESP_LOGE(TAG, "[music] Failed to allocate amplify buffer");
+    (void)args;
+    int16_t *buffer = heap_caps_malloc(PLAYBACK_CHUNK_SIZE,
+                                       MALLOC_CAP_DEFAULT);
+    if (!buffer) {
+        ESP_LOGE(TAG, "Allocate playback buffer failed");
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGI(TAG, "[music] Task started, pcm_size=%u, gain=%.1f", (unsigned)pcm_size, SOFTWARE_GAIN);
+    size_t offset = 0;
+    unsigned loop_count = 0;
+    ESP_LOGI(TAG, "Playback started: %u PCM bytes",
+             (unsigned)s_pcm_size);
 
-    while (1)
-    {
-        size_t remaining = pcm_size - offset;
-        size_t to_write = remaining < chunk_size ? remaining : chunk_size;
+    while (true) {
+        const size_t remaining = s_pcm_size - offset;
+        const size_t write_size = remaining < PLAYBACK_CHUNK_SIZE
+                                      ? remaining
+                                      : PLAYBACK_CHUNK_SIZE;
+        prepare_pcm((const int16_t *)(s_pcm_data + offset), buffer,
+                    write_size / sizeof(int16_t), SOFTWARE_GAIN);
 
-        size_t sample_count = to_write / sizeof(int16_t);
-        amplify_pcm((const int16_t *)(pcm_data + offset), amp_buf, sample_count, SOFTWARE_GAIN);
-
-        esp_err_t ret = esp_codec_dev_write(play_dev, amp_buf, to_write);
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE(TAG, "[music] codec dev write failed: %s", esp_err_to_name(ret));
+        const esp_err_t ret = t_panel_audio_codec_write(s_audio, buffer,
+                                                         write_size);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Audio write failed: %s", esp_err_to_name(ret));
             break;
         }
 
-        offset += to_write;
-        if (offset >= pcm_size)
-        {
-            loop_count++;
-            ESP_LOGI(TAG, "[music] Loop %d complete", loop_count);
+        offset += write_size;
+        if (offset >= s_pcm_size) {
             offset = 0;
+            ESP_LOGI(TAG, "Playback loop %u complete", ++loop_count);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
-    free(amp_buf);
+
+    t_panel_audio_codec_set_speaker_enabled(s_audio, false);
+    free(buffer);
     vTaskDelete(NULL);
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "WAV playback using BSP audio initialization");
+
+    const size_t wav_size = wav_end - wav_start;
+    if (wav_size < sizeof(wav_header_t)) {
+        ESP_LOGE(TAG, "WAV file is too small");
+        return;
+    }
+
+    const wav_header_t *header = (const wav_header_t *)wav_start;
+    if (memcmp(header->riff_tag, "RIFF", 4) != 0 ||
+        memcmp(header->wave_tag, "WAVE", 4) != 0 ||
+        header->audio_format != 1 || header->num_channels != 2) {
+        ESP_LOGE(TAG, "Only stereo PCM WAV files are supported");
+        return;
+    }
+
+    const size_t data_offset = find_data_chunk(wav_start, wav_size);
+    if (!data_offset) {
+        ESP_LOGE(TAG, "WAV data chunk not found");
+        return;
+    }
+    s_pcm_data = wav_start + data_offset;
+    s_pcm_size = wav_size - data_offset;
+
+    ESP_LOGI(TAG, "WAV: %lu Hz, %u-bit, %u channels, PCM=%u bytes",
+             (unsigned long)header->sample_rate, header->bits_per_sample,
+             header->num_channels, (unsigned)s_pcm_size);
+
+    ESP_ERROR_CHECK(t_panel_p4_bsp_init(&s_bsp));
+
+    t_panel_audio_codec_config_t config = T_PANEL_AUDIO_CODEC_CONFIG_DEFAULT();
+    config.sample_rate_hz = header->sample_rate;
+    config.bits_per_sample = header->bits_per_sample;
+    config.playback_channels = header->num_channels;
+    config.enable_playback = true;
+    config.enable_capture = false;
+    config.enable_speaker = true;
+    config.output_volume = AUDIO_OUTPUT_VOLUME;
+    ESP_ERROR_CHECK(t_panel_audio_codec_init(&s_bsp, &config, &s_audio));
+
+    const BaseType_t created = xTaskCreate(playback_task, "playback", 4096,
+                                            NULL, 5, NULL);
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Create playback task failed");
+        ESP_ERROR_CHECK(t_panel_audio_codec_deinit(s_audio));
+        ESP_ERROR_CHECK(t_panel_p4_bsp_deinit(&s_bsp));
+    }
 }

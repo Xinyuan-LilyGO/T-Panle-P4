@@ -15,7 +15,7 @@
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tinyusb_msc.h"
-#include "T_Panle_P4_board_config.h"
+#include "board_config.h"
 
 static const char *TAG = "usb_otg_msc";
 
@@ -24,12 +24,14 @@ static sdmmc_card_t *s_sd_card = NULL;
 
 #define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_MSC_DESC_LEN)
 
-enum {
+enum
+{
     ITF_NUM_MSC = 0,
     ITF_NUM_TOTAL,
 };
 
-enum {
+enum
+{
     EDPT_MSC_OUT = 0x01,
     EDPT_MSC_IN = 0x81,
 };
@@ -107,11 +109,13 @@ static void board_ldo_init(void)
     };
 
     esp_err_t ret = esp_ldo_acquire_channel(&ldo_config, &ldo_handle);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+    {
         ESP_LOGW(TAG, "Acquire LDO channel failed: %s", esp_err_to_name(ret));
     }
 }
 
+#if CONFIG_T_PANEL_P4_HAS_XL9555
 static esp_err_t board_sd_power_enable(i2c_master_bus_handle_t bus_handle)
 {
     esp_io_expander_handle_t expander = NULL;
@@ -128,6 +132,7 @@ static esp_err_t board_sd_power_enable(i2c_master_bus_handle_t bus_handle)
     ESP_LOGI(TAG, "SD card power enabled");
     return ESP_OK;
 }
+#endif
 
 static esp_err_t sdmmc_storage_init(sdmmc_card_t **out_card)
 {
@@ -151,14 +156,16 @@ static esp_err_t sdmmc_storage_init(sdmmc_card_t **out_card)
     ESP_RETURN_ON_FALSE(card, ESP_ERR_NO_MEM, TAG, "No memory for sdmmc_card_t");
 
     esp_err_t ret = (*host.init)();
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         ESP_LOGE(TAG, "SDMMC host init failed: %s", esp_err_to_name(ret));
         free(card);
         return ret;
     }
 
     ret = sdmmc_host_init_slot(host.slot, &slot_config);
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         ESP_LOGE(TAG, "SDMMC slot init failed: %s", esp_err_to_name(ret));
         (*host.deinit)();
         free(card);
@@ -166,11 +173,15 @@ static esp_err_t sdmmc_storage_init(sdmmc_card_t **out_card)
     }
 
     ret = sdmmc_card_init(&host, card);
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         ESP_LOGE(TAG, "SD card init failed: %s", esp_err_to_name(ret));
-        if (host.flags & SDMMC_HOST_FLAG_DEINIT_ARG) {
+        if (host.flags & SDMMC_HOST_FLAG_DEINIT_ARG)
+        {
             host.deinit_p(host.slot);
-        } else {
+        }
+        else
+        {
             (*host.deinit)();
         }
         free(card);
@@ -189,7 +200,8 @@ static void msc_mount_changed_cb(tinyusb_msc_storage_handle_t handle,
     (void)handle;
     (void)arg;
 
-    switch (event->id) {
+    switch (event->id)
+    {
     case TINYUSB_MSC_EVENT_MOUNT_COMPLETE:
         ESP_LOGI(TAG, "MSC storage mounted to %s",
                  event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB host" : "application");
@@ -205,14 +217,17 @@ static void msc_mount_changed_cb(tinyusb_msc_storage_handle_t handle,
 
 void app_main(void)
 {
+    static t_panel_p4_bsp_t bsp;
+    i2c_master_bus_handle_t i2c_bus = NULL;
+
     ESP_LOGI(TAG, "USB MSC SD card example");
+    ESP_ERROR_CHECK(t_panel_p4_bsp_init(&bsp));
+    i2c_bus = t_panel_p4_bsp_get_i2c_bus(&bsp);
 
     board_ldo_init();
-
-    i2c_master_bus_handle_t i2c_bus = NULL;
-    ESP_ERROR_CHECK(board_i2c_init(&i2c_bus));
+#if CONFIG_T_PANEL_P4_HAS_XL9555
     ESP_ERROR_CHECK(board_sd_power_enable(i2c_bus));
-
+#endif
     ESP_ERROR_CHECK(sdmmc_storage_init(&s_sd_card));
 
     tinyusb_msc_storage_config_t storage_cfg = {

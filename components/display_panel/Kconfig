@@ -1,0 +1,31 @@
+menu "Display Panel Configuration"
+
+    choice DISPLAY_PANEL_PIXEL_FORMAT
+        prompt "LCD pixel format"
+        default DISPLAY_PANEL_RGB888
+        help
+            Select the pixel format used by the DPI frame buffers and LVGL.
+
+        config DISPLAY_PANEL_RGB565
+            bool "RGB565 (16 bpp)"
+            help
+                Use 16-bit RGB565 frame buffers to reduce PSRAM usage and
+                MIPI DSI memory bandwidth.
+
+        config DISPLAY_PANEL_RGB888
+            bool "RGB888 (24 bpp)"
+            help
+                Use the panel-specified 24-bit RGB888 DPI format.
+
+    endchoice
+
+    config DISPLAY_PANEL_FRAME_BUFFER_COUNT
+        int "Number of MIPI DPI frame buffers"
+        range 1 2
+        default 2
+        help
+            Select how many complete frame buffers the MIPI DPI driver owns.
+            Partial LVGL rendering normally needs one; direct double-buffered
+            rendering needs two.
+
+endmenu

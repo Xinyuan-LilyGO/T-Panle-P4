@@ -1,0 +1,11 @@
+#pragma once
+
+#include "touch_controller.h"
+
+#define TOUCH_I2C_ADDR 0x68
+#define CHIP_ID_ADDR 0x40008076
+#define TOUCH_DATA_ADDR 0x20011120
+#define SYSTEM_SOFT_RESET_ADDR 0x40008004
+#define POR_INIT_ADDR 0x40008081
+#define FW_VERSION_ADDR 0x20000F1C
+#define RESOLUTION_ADDR 0x20000904

@@ -8,7 +8,7 @@
 #include "esp_io_expander.h"
 #include "esp_io_expander_xl9555.h"
 #include "radio_esp32p4_hal.h"
-#include "T_Panle_P4_board_config.h"
+#include "board_config.h"
 
 // #define LORA_TX 1
 

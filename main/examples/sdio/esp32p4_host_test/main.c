@@ -18,7 +18,6 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 
-#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 
@@ -28,13 +27,6 @@
 #include "esp_serial_slave_link/essl_sdio.h"
 #include "sdkconfig.h"
 #include "sdmmc_cmd.h"
-
-#include "driver/i2c_master.h"
-#include "esp_io_expander.h"
-#include "esp_io_expander_xl9555.h"
-#include "button_gpio.h"
-#include "iot_button.h"
-#include "T_Panle_P4_board_config.h"
 
 #define TIMEOUT_MAX UINT32_MAX
 
@@ -114,8 +106,6 @@ static const char TAG[] = "example_host";
 #define SLAVE_REG_JOB 0
 #define SLAVE_REG_VALUE 1
 
-static esp_io_expander_handle_t s_expander;
-static bool s_uart_to_c5;
 
 typedef enum
 {
@@ -509,93 +499,10 @@ void job_getint(essl_handle_t handle)
     slave_inform_job(handle, JOB_SEND_INT);
 }
 
-static esp_err_t set_uart_mux(bool to_c5)
-{
-    const uint32_t pin_mask = BIT(XL9555_UART_SEL);
-
-    if (!to_c5) {
-        ESP_RETURN_ON_ERROR(esp_io_expander_set_level(s_expander, pin_mask, 0),
-                            TAG, "switch UART mux to P4 failed");
-        s_uart_to_c5 = false;
-        ESP_LOGI(TAG, "UART output switched to P4 (XL9555_UART_SEL=0)");
-        return ESP_OK;
-    }
-
-    ESP_LOGI(TAG, "UART output switching to C5 (XL9555_UART_SEL=1)");
-    ESP_RETURN_ON_ERROR(esp_io_expander_set_level(s_expander, pin_mask, 1),
-                        TAG, "switch UART mux to C5 failed");
-    s_uart_to_c5 = true;
-    return ESP_OK;
-}
-
-static esp_err_t init_board_io(void)
-{
-    i2c_master_bus_handle_t bus_handle = NULL;
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = 0,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &bus_handle), TAG, "I2C init failed");
-    ESP_RETURN_ON_ERROR(esp_io_expander_new_i2c_xl9555(bus_handle, XL9555_I2C_ADDR, &s_expander),
-                        TAG, "XL9555 init failed");
-    ESP_RETURN_ON_ERROR(esp_io_expander_set_dir(s_expander, BIT(XL9555_UART_SEL), IO_EXPANDER_OUTPUT),
-                        TAG, "set XL9555_UART_SEL output failed");
-    ESP_RETURN_ON_ERROR(set_uart_mux(false), TAG, "set default UART mux failed");
-
-    return ESP_OK;
-}
-
-static void button_event_cb(void *arg, void *data)
-{
-    button_event_t event = iot_button_get_event(arg);
-    ESP_LOGI(TAG, "%s", iot_button_get_event_str(event));
-    static bool s_uart_to_c5 = false;
-    if (event == BUTTON_SINGLE_CLICK)
-    {
-        ESP_LOGI(TAG, "button single click");
-        if(s_uart_to_c5)
-        {
-            set_uart_mux(false);
-            s_uart_to_c5 = false;
-        }
-        else
-        {
-            set_uart_mux(true);
-            s_uart_to_c5 = true;
-        }
-    }
-}
-
-static void button_init(void)
-{
-    const button_config_t btn_cfg = {0};
-    const button_gpio_config_t btn_gpio_cfg = {
-        .gpio_num = 36,
-        .active_level = 0,
-    };
-
-    button_handle_t btn = NULL;
-    esp_err_t ret = iot_button_new_gpio_device(&btn_cfg, &btn_gpio_cfg, &btn);
-    ESP_ERROR_CHECK(ret);
-    
-    iot_button_register_cb(btn, BUTTON_SINGLE_CLICK, NULL, button_event_cb, NULL);
-    uint8_t level = 0;
-    level = iot_button_get_key_level(btn);
-    ESP_LOGI(TAG, "button level is %d", level);
-}
-
 void app_main(void)
 {
     essl_handle_t handle;
     esp_err_t err;
-    ESP_ERROR_CHECK(init_board_io());
-    button_init();
-
     // enable the power if on espressif SDIO master-slave board
     slave_power_on();
 

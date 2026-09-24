@@ -1,0 +1,5 @@
+dependencies:
+  espressif/esp_io_expander:
+    version: "1.2.1"
+  sheldonix/esp_io_expander_xl9555:
+    version: "0.8.0"

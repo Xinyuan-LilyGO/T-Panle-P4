@@ -1,0 +1,3 @@
+# The 720x720 framebuffer is allocated from external RAM.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y

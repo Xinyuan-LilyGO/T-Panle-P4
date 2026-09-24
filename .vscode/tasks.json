@@ -1,0 +1,109 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "T-Panel-P4: Select and Build Example",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tools\\select_example.ps1",
+        "-Board",
+        "${input:tPanelBoard}",
+        "-Example",
+        "${input:tPanelExample}",
+        "-Build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "T-Panel-P4: Select Example Only",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\tools\\select_example.ps1",
+        "-Board",
+        "${input:tPanelBoard}",
+        "-Example",
+        "${input:tPanelExample}"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "tPanelBoard",
+      "type": "pickString",
+      "description": "Select the T-Panel-P4 board",
+      "default": "standard",
+      "options": [
+        "standard",
+        "round",
+        "rect"
+      ]
+    },
+    {
+      "id": "tPanelExample",
+      "type": "pickString",
+      "description": "Select the example",
+      "default": "factory",
+      "options": [
+        "factory",
+        "xl9555",
+        "lora_sx1276",
+        "lora_sx1262",
+        "lora_lr1121",
+        "lora_lr2021",
+        "axp517",
+        "lcd",
+        "lcd1",
+        "lcd_touch",
+        "audio_play_wav",
+        "audio_record",
+        "audio_loopback",
+        "camera",
+        "camera_esp_video",
+        "camera_flash_led",
+        "esp32p4_host_wifi",
+        "esp32p4_host_test",
+        "sd",
+        "sgm38121",
+        "drv2605",
+        "qmc6309",
+        "qmi8658c",
+        "lvgl",
+        "usb_otg_msc",
+        "codex_keyboard"
+      ]
+    }
+  ]
+}

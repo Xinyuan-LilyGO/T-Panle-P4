@@ -13,6 +13,8 @@ extern "C" {
 #endif
 
 #define AXP517_I2C_ADDR         0x34
+#define AXP517_IRQ_GPIO_UNUSED  (-1)
+#define AXP517_DEFAULT_RUNTIME_LOG_INTERVAL_MS 3000U
 
 /* BMU registers */
 #define AXP517_REG_STATUS0      0x00
@@ -143,12 +145,15 @@ extern "C" {
 #define AXP517_REG_TX_BUFFER      0xDC
 
 /* Bit definitions */
-#define AXP517_VBUS_PRESENT       (1U << 7)
 #define AXP517_VBUS_GOOD          (1U << 5)
 #define AXP517_BATFET_ON          (1U << 4)
 #define AXP517_BAT_PRESENT        (1U << 3)
 #define AXP517_THERMAL_REGULATION (1U << 1)
 #define AXP517_CURRENT_LIMIT      (1U << 0)
+
+#define AXP517_PD_VBUS_PRESENT                (1U << 2)
+#define AXP517_PD_DEBUG_ACCESSORY             (1U << 7)
+#define AXP517_PD_COMMAND_ENABLE_VBUS_DETECT 0x33
 
 #define AXP517_MOD0_BC12_EN       (1U << 4)
 #define AXP517_MOD0_TYPEC_EN      (1U << 3)
@@ -297,6 +302,12 @@ typedef enum {
 
 typedef struct {
     i2c_master_dev_handle_t dev_handle;
+    int irq_gpio;
+    volatile bool irq_pending;
+    bool irq_handler_registered;
+    bool runtime_log_enabled;
+    uint32_t runtime_log_interval_ms;
+    int64_t last_runtime_log_us;
 } axp517_handle_t;
 
 typedef struct {
@@ -337,6 +348,16 @@ typedef struct {
 
 esp_err_t axp517_init(axp517_handle_t *handle, i2c_master_bus_handle_t bus_handle, uint8_t addr);
 esp_err_t axp517_deinit(axp517_handle_t *handle);
+
+/* Board-facing default setup and periodic service. Pass AXP517_IRQ_GPIO_UNUSED
+ * when the IRQ pin is not connected; the service then polls IRQ registers. */
+esp_err_t axp517_init_default(axp517_handle_t *handle,
+                              i2c_master_bus_handle_t bus_handle,
+                              int irq_gpio);
+esp_err_t axp517_set_runtime_log(axp517_handle_t *handle,
+                                 bool enable,
+                                 uint32_t interval_ms);
+esp_err_t axp517_process(axp517_handle_t *handle);
 
 esp_err_t axp517_write_byte(axp517_handle_t *handle, uint8_t reg, uint8_t val);
 esp_err_t axp517_read_byte(axp517_handle_t *handle, uint8_t reg, uint8_t *val);

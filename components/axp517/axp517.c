@@ -1,4 +1,5 @@
 #include "axp517.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include <stdio.h>
 #include <string.h>
@@ -99,6 +100,7 @@ esp_err_t axp517_init(axp517_handle_t *handle, i2c_master_bus_handle_t bus_handl
     }
 
     memset(handle, 0, sizeof(*handle));
+    handle->irq_gpio = AXP517_IRQ_GPIO_UNUSED;
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = addr,
@@ -131,11 +133,23 @@ esp_err_t axp517_deinit(axp517_handle_t *handle)
         return ret;
     }
 
+    esp_err_t first_error = ESP_OK;
+    if (handle->irq_handler_registered) {
+        ret = gpio_isr_handler_remove((gpio_num_t)handle->irq_gpio);
+        if (ret == ESP_OK) {
+            handle->irq_handler_registered = false;
+        } else {
+            first_error = ret;
+        }
+    }
+
     ret = i2c_master_bus_rm_device(handle->dev_handle);
     if (ret == ESP_OK) {
         handle->dev_handle = NULL;
+    } else if (first_error == ESP_OK) {
+        first_error = ret;
     }
-    return ret;
+    return first_error;
 }
 
 esp_err_t axp517_enable_charger(axp517_handle_t *handle, bool enable)
@@ -292,6 +306,7 @@ esp_err_t axp517_get_status(axp517_handle_t *handle, axp517_status_t *status)
 
     uint8_t st0 = 0;
     uint8_t st1 = 0;
+    uint8_t power_status = 0;
     esp_err_t ret = axp517_read_byte(handle, AXP517_REG_STATUS0, &st0);
     if (ret != ESP_OK) {
         return ret;
@@ -300,13 +315,18 @@ esp_err_t axp517_get_status(axp517_handle_t *handle, axp517_status_t *status)
     if (ret != ESP_OK) {
         return ret;
     }
+    ret = axp517_read_byte(handle, AXP517_REG_POWER_STATUS, &power_status);
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     memset(status, 0, sizeof(*status));
     status->status0 = st0;
     status->status1 = st1;
-    status->vbus_present = (st0 & AXP517_VBUS_PRESENT) != 0;
     status->vbus_good = (st0 & AXP517_VBUS_GOOD) != 0;
+    status->vbus_present = status->vbus_good || (power_status & AXP517_PD_VBUS_PRESENT) != 0;
     status->bat_present = (st0 & AXP517_BAT_PRESENT) != 0;
+    /* Datasheet wording "open" means enabled/on for this status bit. */
     status->batfet_on = (st0 & AXP517_BATFET_ON) != 0;
     status->thermal_regulation = (st0 & AXP517_THERMAL_REGULATION) != 0;
     status->current_limit = (st0 & AXP517_CURRENT_LIMIT) != 0;
@@ -410,17 +430,23 @@ esp_err_t axp517_clear_fault(axp517_handle_t *handle, uint8_t fault1_mask)
 
 esp_err_t axp517_get_vbus_status(axp517_handle_t *handle, bool *present, bool *good)
 {
-    uint8_t val = 0;
-    esp_err_t ret = axp517_read_byte(handle, AXP517_REG_STATUS0, &val);
+    uint8_t status0 = 0;
+    esp_err_t ret = axp517_read_byte(handle, AXP517_REG_STATUS0, &status0);
     if (ret != ESP_OK) {
         return ret;
     }
+    bool vbus_good = (status0 & AXP517_VBUS_GOOD) != 0;
 
     if (present) {
-        *present = (val & AXP517_VBUS_PRESENT) != 0;
+        uint8_t power_status = 0;
+        ret = axp517_read_byte(handle, AXP517_REG_POWER_STATUS, &power_status);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        *present = vbus_good || (power_status & AXP517_PD_VBUS_PRESENT) != 0;
     }
     if (good) {
-        *good = (val & AXP517_VBUS_GOOD) != 0;
+        *good = vbus_good;
     }
     return ESP_OK;
 }

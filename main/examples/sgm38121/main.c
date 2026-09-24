@@ -13,7 +13,7 @@
 #include "esp_chip_info.h"
 #include "esp_system.h"
 
-#include "T_Panle_P4_board_config.h"
+#include "board_config.h"
 #include "driver/i2c_master.h"
 #include "sgm38121.h"
 

@@ -1,0 +1,11 @@
+list(APPEND EXAMPLE_SRCS "${CMAKE_CURRENT_LIST_DIR}/main.c")
+list(APPEND EXAMPLE_INCLUDE_DIRS "${CMAKE_CURRENT_LIST_DIR}")
+list(APPEND EXAMPLE_REQUIRES esp_driver_i2c esp_driver_jpeg display_panel touch_panel t_panel_p4_bsp)
+
+if(CONFIG_T_PANEL_P4_BOARD_RECT)
+    list(APPEND EXAMPLE_EMBED_FILES "${CMAKE_CURRENT_LIST_DIR}/wallhaven-o5k319_resized.jpg")
+elseif(CONFIG_T_PANEL_P4_BOARD_ROUND)
+    list(APPEND EXAMPLE_EMBED_FILES "${CMAKE_CURRENT_LIST_DIR}/wallhaven-8gr6l2_resized_circle.jpg")
+else()
+    list(APPEND EXAMPLE_EMBED_FILES "${CMAKE_CURRENT_LIST_DIR}/wallhaven-8gr6l2_resized.jpg")
+endif()

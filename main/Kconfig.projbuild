@@ -3,44 +3,98 @@ menu "Example Configuration"
     choice
         prompt "Select the example to build"
         default EXAMPLE_FACTORY
-                config EXAMPLE_FACTORY
-                    bool "FACTORY"
-                    select TINYUSB_MSC_ENABLED
-                config EXAMPLE_XL9555
-                    bool "XL9555"
-                config EXAMPLE_LORA_SX1276
-                    bool "LORA_SX1276"
-                config EXAMPLE_LORA_SX1262
-                    bool "LORA_SX1262"
-                config EXAMPLE_LORA_LR1121
-                    bool "LORA_LR1121"
-                config EXAMPLE_AXP517
-                    bool "AXP517"
-                config EXAMPLE_LCD
-                    bool "LCD"
-                config EXAMPLE_AUDIO_PLAY_WAV
-                    bool "AUDIO_PLAY_WAV"
-                config EXAMPLE_AUDIO_RECORD
-                    bool "AUDIO_RECORD"
-                config EXAMPLE_AUDIO_LOOPBACK
-                    bool "AUDIO_LOOPBACK"
-                config EXAMPLE_CAMERA
-                    bool "CAMERA"
-                config EXAMPLE_CAMERA_ESP_VIDEO
-                    bool "CAMERA_ESP_VIDEO"
-                config EXAMPLE_ESP32P4_HOST_WIFI
-                    bool "ESP32P4_HOST_WIFI"
-                config EXAMPLE_ESP32P4_HOST_TEST
-                    bool "ESP32P4_HOST_TEST"
-                config EXAMPLE_SD
-                    bool "SD"
-                config EXAMPLE_SGM38121
-                    bool "SGM38121"
-                config EXAMPLE_LVGL
-                    bool "LVGL"
-                config EXAMPLE_USB_OTG_MSC
-                    bool "USB_OTG_MSC"
-                    select TINYUSB_MSC_ENABLED
+
+        config EXAMPLE_FACTORY
+            bool "FACTORY"
+            select TINYUSB_MSC_ENABLED
+            select LV_FONT_MONTSERRAT_12
+            select LV_FONT_MONTSERRAT_14
+            select LV_FONT_MONTSERRAT_16
+            select LV_FONT_MONTSERRAT_20
+            select LV_FONT_MONTSERRAT_24
+            select LV_FONT_MONTSERRAT_28
+            select LV_FONT_MONTSERRAT_40
+
+        config EXAMPLE_XL9555
+            bool "XL9555"
+
+        config EXAMPLE_LORA_SX1276
+            bool "LORA_SX1276"
+
+        config EXAMPLE_LORA_SX1262
+            bool "LORA_SX1262"
+
+        config EXAMPLE_LORA_LR1121
+            bool "LORA_LR1121"
+
+        config EXAMPLE_LORA_LR2021
+            bool "LORA_LR2021"
+
+        config EXAMPLE_AXP517
+            bool "AXP517"
+
+        config EXAMPLE_LCD
+            bool "LCD"
+
+        config EXAMPLE_LCD_TOUCH
+            bool "LCD_TOUCH"
+
+        config EXAMPLE_AUDIO_PLAY_WAV
+            bool "AUDIO_PLAY_WAV"
+
+        config EXAMPLE_AUDIO_RECORD
+            bool "AUDIO_RECORD"
+
+        config EXAMPLE_AUDIO_LOOPBACK
+            bool "AUDIO_LOOPBACK"
+
+        config EXAMPLE_CAMERA
+            bool "CAMERA"
+
+        config EXAMPLE_CAMERA_ESP_VIDEO
+            bool "CAMERA_ESP_VIDEO"
+
+        config EXAMPLE_CAMERA_FLASH_LED
+            bool "CAMERA_FLASH_LED"
+            depends on T_PANEL_P4_BOARD_RECT
+
+        config EXAMPLE_ESP32P4_HOST_WIFI
+            bool "ESP32P4_HOST_WIFI"
+
+        config EXAMPLE_ESP32P4_HOST_TEST
+            bool "ESP32P4_HOST_TEST"
+
+        config EXAMPLE_SD
+            bool "SD"
+
+        config EXAMPLE_SGM38121
+            bool "SGM38121"
+
+        config EXAMPLE_SENSOR
+            bool "SENSOR"
+            depends on T_PANEL_P4_BOARD_RECT
+
+        config EXAMPLE_DRV2605
+            bool "DRV2605"
+            depends on T_PANEL_P4_BOARD_RECT
+
+        config EXAMPLE_QMC6309
+            bool "QMC6309"
+            depends on T_PANEL_P4_BOARD_RECT
+
+        config EXAMPLE_QMI8658C
+            bool "QMI8658C"
+            depends on T_PANEL_P4_BOARD_RECT
+
+        config EXAMPLE_LVGL
+            bool "LVGL"
+
+        config EXAMPLE_USB_OTG_MSC
+            bool "USB_OTG_MSC"
+            select TINYUSB_MSC_ENABLED
+
+        config EXAMPLE_CODEX_KEYBOARD
+            bool "CODEX_KEYBOARD"
 
     endchoice
 

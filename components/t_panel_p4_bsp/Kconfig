@@ -1,0 +1,39 @@
+menu "T-Panel-P4 Board Configuration"
+
+    choice
+        prompt "Select the board variant"
+        default T_PANEL_P4_BOARD_STANDARD
+
+        config T_PANEL_P4_BOARD_STANDARD
+            bool "Standard"
+
+        config T_PANEL_P4_BOARD_ROUND
+            bool "Round"
+
+        config T_PANEL_P4_BOARD_RECT
+            bool "Rect"
+
+    endchoice
+
+    config T_PANEL_P4_BOARD_NAME
+        string
+        default "T-Panel-P4" if T_PANEL_P4_BOARD_STANDARD
+        default "T-Panel-P4 Round" if T_PANEL_P4_BOARD_ROUND
+        default "T-Panel-P4 Rect" if T_PANEL_P4_BOARD_RECT
+
+    config T_PANEL_P4_HAS_LORA
+        bool
+        default y if T_PANEL_P4_BOARD_STANDARD || T_PANEL_P4_BOARD_ROUND
+        default n
+
+    config T_PANEL_P4_HAS_XL9555
+        bool
+        default y if T_PANEL_P4_BOARD_STANDARD || T_PANEL_P4_BOARD_ROUND
+        default n
+
+    config T_PANEL_P4_HAS_ESP32C5
+        bool
+        default y if T_PANEL_P4_BOARD_STANDARD || T_PANEL_P4_BOARD_ROUND
+        default n
+
+endmenu

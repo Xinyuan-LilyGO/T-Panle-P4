@@ -1,379 +1,131 @@
-/*
- * ESP32-P4 + OV2710 MIPI CSI preview through esp_video/ISP.
- *
- * This example keeps the low-level CSI example untouched and uses the V4L2-like
- * esp_video path instead. The CSI video device starts the ISP internally when a
- * non-RAW format such as RGB24 is requested from a RAW10 sensor.
- */
+/* ESP32-P4 + OV2710 MIPI CSI preview using the camera_ov2710 component. */
 
-#include <errno.h>
-#include <fcntl.h>
-#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
 #include "esp_cache.h"
 #include "esp_check.h"
 #include "esp_err.h"
-#include "esp_ldo_regulator.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "T_Panle_P4_board_config.h"
-#include "driver/i2c_master.h"
-#include "esp_io_expander.h"
-#include "esp_io_expander_xl9555.h"
-#include "esp_video_device.h"
-#include "esp_video_init.h"
-#include "esp_video_ioctl.h"
-#include "linux/videodev2.h"
-#include "sgm38121.h"
-
-#include "lcd_jd9365_driver.h"
+#include "camera_ov2710.h"
+#include "driver/ppa.h"
+#include "display_panel.h"
 
 static const char *TAG = "camera_esp_video";
 
-#define CAM_VIDEO_DEVICE              ESP_VIDEO_MIPI_CSI_DEVICE_NAME
-#define CAM_VIDEO_BUFFER_COUNT        3
-#define CAM_SENSOR_WIDTH              1280
-#define CAM_SENSOR_HEIGHT             720
-#define CAM_PREVIEW_WIDTH             LCD_H_RES
-#define CAM_PREVIEW_HEIGHT            LCD_V_RES
-#define CAM_PREVIEW_FPS               25
-#define CAM_PREVIEW_PIX_FORMAT        V4L2_PIX_FMT_RGB565
-#define CAM_PREVIEW_BYTES_PER_PIXEL   2
-#define CAM_LCD_BYTES_PER_PIXEL       (LCD_BIT_PER_PIXEL / 8)
-#define CAM_LCD_BOTTOM_GUARD_LINES    2
-#define CAM_PREVIEW_CROP_LEFT         ((CAM_SENSOR_WIDTH - CAM_PREVIEW_WIDTH) / 2)
-#define CAM_PREVIEW_CROP_TOP          ((CAM_SENSOR_HEIGHT - CAM_PREVIEW_HEIGHT) / 2)
-#define MIPI_CSI_PHY_PWR_LDO_CHAN     3
-#define MIPI_CSI_PHY_PWR_VOLTAGE_MV   2500
-
-typedef struct {
-    int fd;
-    void *buffers[CAM_VIDEO_BUFFER_COUNT];
-    size_t buffer_lengths[CAM_VIDEO_BUFFER_COUNT];
-    uint32_t width;
-    uint32_t height;
-    uint32_t pix_format;
-    bool streaming;
-} video_stream_t;
-
-static sgm38121_handle_t pmic;
-static esp_io_expander_handle_t expander = NULL;
-static esp_ldo_channel_handle_t ldo_mipi_phy = NULL;
-static lcd_driver_t lcd = {};
-static video_stream_t stream = {
-    .fd = -1,
-};
-static bool use_isp_crop = false;
-
-static esp_err_t init_sgm38121(i2c_master_bus_handle_t bus_handle)
-{
-    ESP_RETURN_ON_ERROR(sgm38121_init(&pmic, bus_handle, SGM38121_I2C_ADDR), TAG, "SGM38121 init failed");
-
-    ESP_RETURN_ON_ERROR(sgm38121_set_dvdd1_voltage(&pmic, 1500), TAG, "Set DVDD1 failed");
-    ESP_RETURN_ON_ERROR(sgm38121_set_avdd1_voltage(&pmic, 2800), TAG, "Set AVDD1 failed");
-    ESP_RETURN_ON_ERROR(sgm38121_set_avdd2_voltage(&pmic, 3300), TAG, "Set AVDD2 failed");
-
-    ESP_RETURN_ON_ERROR(sgm38121_set_sequence(&pmic, SGM38121_CH_DVDD1, SGM38121_SEQ_SLOT_1), TAG, "Set DVDD1 sequence failed");
-    ESP_RETURN_ON_ERROR(sgm38121_set_sequence(&pmic, SGM38121_CH_AVDD1, SGM38121_SEQ_SLOT_2), TAG, "Set AVDD1 sequence failed");
-    ESP_RETURN_ON_ERROR(sgm38121_set_sequence(&pmic, SGM38121_CH_AVDD2, SGM38121_SEQ_SLOT_3), TAG, "Set AVDD2 sequence failed");
-
-    ESP_RETURN_ON_ERROR(sgm38121_seq_powerup(&pmic), TAG, "Camera power-up sequence failed");
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    return ESP_OK;
-}
-
-static esp_err_t init_mipi_phy_ldo(void)
-{
-    esp_ldo_channel_config_t ldo_cfg = {
-        .chan_id = MIPI_CSI_PHY_PWR_LDO_CHAN,
-        .voltage_mv = MIPI_CSI_PHY_PWR_VOLTAGE_MV,
-    };
-
-    esp_err_t ret = esp_ldo_acquire_channel(&ldo_cfg, &ldo_mipi_phy);
-    if (ret == ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "MIPI PHY LDO channel already acquired, continue");
-        return ESP_OK;
-    }
-
-    ESP_RETURN_ON_ERROR(ret, TAG, "MIPI PHY LDO acquire failed");
-    ESP_LOGI(TAG, "MIPI PHY LDO%d enabled at %dmV", MIPI_CSI_PHY_PWR_LDO_CHAN, MIPI_CSI_PHY_PWR_VOLTAGE_MV);
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    return ESP_OK;
-}
-
-static esp_err_t init_board_i2c(i2c_master_bus_handle_t *ret_bus)
-{
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = 0,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, ret_bus), TAG, "I2C bus init failed");
-    return ESP_OK;
-}
-
-static esp_err_t init_video_system(i2c_master_bus_handle_t i2c_bus)
-{
-    esp_video_init_csi_config_t csi_cfg = {
-        .sccb_config = {
-            .init_sccb = false,
-            .i2c_handle = i2c_bus,
-            .freq = 400000,
-        },
-        .reset_pin = -1,
-        .pwdn_pin = -1,
-        .dont_init_ldo = true,
-    };
-    esp_video_init_config_t video_cfg = {
-        .csi = &csi_cfg,
-    };
-
-    ESP_RETURN_ON_ERROR(esp_video_init_with_flags(&video_cfg,
-                        ESP_VIDEO_INIT_FLAGS_MIPI_CSI | ESP_VIDEO_INIT_FLAGS_ISP),
-                        TAG, "esp_video init failed");
-    ESP_LOGI(TAG, "esp_video initialized with MIPI CSI + ISP");
-
-    return ESP_OK;
-}
+#define CAM_DISPLAY_FPS 25
+#define CAM_DISPLAY_FRAME_INTERVAL_US (1000000 / CAM_DISPLAY_FPS)
+#define CAM_PREVIEW_BYTES_PER_PIXEL 2
+#define CAM_LCD_BYTES_PER_PIXEL (DISPLAY_PANEL_BITS_PER_PIXEL / 8)
+#define CAM_PPA_SCALE_FRACTION_STEPS 16U
+#define CAM_PPA_SCALE_MAX_STEPS ((255U * CAM_PPA_SCALE_FRACTION_STEPS) + 15U)
+#if DISPLAY_PANEL_BITS_PER_PIXEL == 16
+#define CAM_PPA_LCD_COLOR_MODE PPA_SRM_COLOR_MODE_RGB565
+#else
+#define CAM_PPA_LCD_COLOR_MODE PPA_SRM_COLOR_MODE_RGB888
+#endif
+#define CAM_LCD_BOTTOM_GUARD_LINES 2
+static t_panel_p4_bsp_t bsp = {};
+static display_panel_t lcd = {};
+static camera_ov2710_handle_t camera = NULL;
+static ppa_client_handle_t ppa_srm = NULL;
+static bool ppa_disabled = false;
+static bool ppa_disable_logged = false;
+static bool ppa_geometry_logged = false;
 
 static esp_err_t init_lcd(void)
 {
-    ESP_RETURN_ON_ERROR(lcd_jd9365_init(&lcd, expander), TAG, "LCD init failed");
-    ESP_RETURN_ON_ERROR(lcd_backlight_init(), TAG, "LCD backlight init failed");
-    ESP_RETURN_ON_ERROR(lcd_backlight_set_brightness(60), TAG, "LCD backlight set failed");
-    ESP_LOGI(TAG, "LCD ready: %ux%u BGR888", LCD_H_RES, LCD_V_RES);
+    ESP_RETURN_ON_ERROR(display_panel_init(
+                            &lcd, t_panel_p4_bsp_get_io_expander(&bsp)),
+                        TAG, "LCD init failed");
+    ESP_RETURN_ON_ERROR(display_panel_backlight_init(), TAG, "LCD backlight init failed");
+    ESP_RETURN_ON_ERROR(display_panel_set_brightness(60), TAG, "LCD backlight set failed");
+    ESP_LOGI(TAG, "LCD ready: %ux%u, %ubpp", DISPLAY_PANEL_H_RES, DISPLAY_PANEL_V_RES,
+             DISPLAY_PANEL_BITS_PER_PIXEL);
 
     return ESP_OK;
 }
 
 static esp_err_t show_lcd_test_pattern(void)
 {
-    uint8_t *lcd_fb = lcd_jd9365_get_next_frame_buffer(&lcd);
+    uint8_t *lcd_fb = display_panel_get_next_frame_buffer(&lcd);
     ESP_RETURN_ON_FALSE(lcd_fb, ESP_ERR_INVALID_STATE, TAG, "LCD framebuffer is NULL");
 
-    const uint32_t stripe_h = LCD_V_RES / 3;
+    const uint32_t stripe_h = DISPLAY_PANEL_V_RES / 3;
     uint8_t *p = lcd_fb;
-    for (uint32_t y = 0; y < LCD_V_RES; y++) {
+    for (uint32_t y = 0; y < DISPLAY_PANEL_V_RES; y++)
+    {
         uint8_t b = 0xff;
         uint8_t g = 0;
         uint8_t r = 0;
 
-        if (y < stripe_h) {
+        if (y < stripe_h)
+        {
             b = 0;
             r = 0xff;
-        } else if (y < stripe_h * 2) {
+        }
+        else if (y < stripe_h * 2)
+        {
             b = 0;
             g = 0xff;
         }
 
-        for (uint32_t x = 0; x < LCD_H_RES; x++) {
-            *p++ = b;
-            *p++ = g;
+        for (uint32_t x = 0; x < DISPLAY_PANEL_H_RES; x++)
+        {
+#if DISPLAY_PANEL_BITS_PER_PIXEL == 16
+            uint16_t rgb565 = (uint16_t)(((uint16_t)(r & 0xf8) << 8) |
+                                         ((uint16_t)(g & 0xfc) << 3) |
+                                         ((uint16_t)b >> 3));
+            *p++ = (uint8_t)rgb565;
+            *p++ = (uint8_t)(rgb565 >> 8);
+#else
             *p++ = r;
+            *p++ = g;
+            *p++ = b;
+#endif
         }
     }
 
-    ESP_RETURN_ON_ERROR(lcd_jd9365_draw_bitmap(&lcd, 0, 0, LCD_H_RES, LCD_V_RES, lcd_fb),
+    ESP_RETURN_ON_ERROR(esp_cache_msync(lcd_fb,
+                                        (size_t)DISPLAY_PANEL_H_RES * DISPLAY_PANEL_V_RES * CAM_LCD_BYTES_PER_PIXEL,
+                                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED),
+                        TAG, "LCD test pattern cache sync failed");
+    ESP_RETURN_ON_ERROR(display_panel_draw_bitmap(&lcd, 0, 0, DISPLAY_PANEL_H_RES,
+                                                  DISPLAY_PANEL_V_RES, lcd_fb),
                         TAG, "LCD test pattern draw failed");
-    ESP_LOGI(TAG, "LCD BGR888 test pattern displayed");
+    ESP_LOGI(TAG, "LCD test pattern displayed");
     vTaskDelay(pdMS_TO_TICKS(500));
 
     return ESP_OK;
 }
 
-static void log_video_formats(int fd)
+static inline void rgb565_to_lcd(const uint8_t *src, uint8_t *dst)
 {
-    struct v4l2_fmtdesc fmtdesc = {
-        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-    };
-
-    for (uint32_t i = 0; ; i++) {
-        memset(&fmtdesc, 0, sizeof(fmtdesc));
-        fmtdesc.index = i;
-        fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        if (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) != 0) {
-            break;
-        }
-
-        ESP_LOGI(TAG, "format[%" PRIu32 "]: " V4L2_FMT_STR " %s",
-                 i, V4L2_FMT_STR_ARG(fmtdesc.pixelformat), fmtdesc.description);
-    }
-}
-
-static esp_err_t set_center_crop(int fd)
-{
-    struct v4l2_selection selection = {
-        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-        .target = V4L2_SEL_TGT_CROP,
-        .r = {
-            .left = CAM_PREVIEW_CROP_LEFT,
-            .top = CAM_PREVIEW_CROP_TOP,
-            .width = CAM_PREVIEW_WIDTH,
-            .height = CAM_PREVIEW_HEIGHT,
-        },
-    };
-
-    if (ioctl(fd, VIDIOC_S_SELECTION, &selection) != 0) {
-        ESP_LOGW(TAG, "ISP crop is not available, use sensor-size ISP output and software center crop/scale, errno=%d", errno);
-        use_isp_crop = false;
-        return ESP_OK;
-    }
-
-    use_isp_crop = true;
-    ESP_LOGI(TAG, "Center crop set: left=%d, top=%d, %dx%d",
-             selection.r.left, selection.r.top, selection.r.width, selection.r.height);
-
-    return ESP_OK;
-}
-
-static esp_err_t set_preview_format(video_stream_t *s)
-{
-    uint32_t width = use_isp_crop ? CAM_PREVIEW_WIDTH : CAM_SENSOR_WIDTH;
-    uint32_t height = use_isp_crop ? CAM_PREVIEW_HEIGHT : CAM_SENSOR_HEIGHT;
-    struct v4l2_format format = {
-        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-        .fmt.pix = {
-            .width = width,
-            .height = height,
-            .pixelformat = CAM_PREVIEW_PIX_FORMAT,
-        },
-    };
-
-    ESP_RETURN_ON_FALSE(ioctl(s->fd, VIDIOC_S_FMT, &format) == 0,
-                        ESP_FAIL, TAG, "Set preview format failed, errno=%d", errno);
-
-    memset(&format, 0, sizeof(format));
-    format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ESP_RETURN_ON_FALSE(ioctl(s->fd, VIDIOC_G_FMT, &format) == 0,
-                        ESP_FAIL, TAG, "Get preview format failed, errno=%d", errno);
-
-    s->width = format.fmt.pix.width;
-    s->height = format.fmt.pix.height;
-    s->pix_format = format.fmt.pix.pixelformat;
-
-    ESP_LOGI(TAG, "Preview format: %ux%u " V4L2_FMT_STR ", sizeimage=%" PRIu32,
-             s->width, s->height, V4L2_FMT_STR_ARG(s->pix_format), format.fmt.pix.sizeimage);
-    ESP_RETURN_ON_FALSE(s->width == width &&
-                        s->height == height &&
-                        s->pix_format == CAM_PREVIEW_PIX_FORMAT,
-                        ESP_ERR_NOT_SUPPORTED, TAG, "Unexpected video format after S_FMT");
-
-    return ESP_OK;
-}
-
-static esp_err_t set_preview_fps(int fd)
-{
-    struct v4l2_streamparm sparm = {
-        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-        .parm.capture = {
-            .capability = V4L2_CAP_TIMEPERFRAME,
-            .timeperframe = {
-                .numerator = 1,
-                .denominator = CAM_PREVIEW_FPS,
-            },
-        },
-    };
-
-    if (ioctl(fd, VIDIOC_S_PARM, &sparm) != 0) {
-        ESP_LOGW(TAG, "Set FPS=%d failed, continue with sensor default, errno=%d", CAM_PREVIEW_FPS, errno);
-        return ESP_OK;
-    }
-
-    ESP_LOGI(TAG, "Preview FPS requested: %d", CAM_PREVIEW_FPS);
-    return ESP_OK;
-}
-
-static esp_err_t request_and_queue_buffers(video_stream_t *s)
-{
-    struct v4l2_requestbuffers req = {
-        .count = CAM_VIDEO_BUFFER_COUNT,
-        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-        .memory = V4L2_MEMORY_MMAP,
-    };
-
-    ESP_RETURN_ON_FALSE(ioctl(s->fd, VIDIOC_REQBUFS, &req) == 0,
-                        ESP_FAIL, TAG, "Request video buffers failed, errno=%d", errno);
-    ESP_RETURN_ON_FALSE(req.count >= CAM_VIDEO_BUFFER_COUNT,
-                        ESP_ERR_NO_MEM, TAG, "Only %" PRIu32 " buffers allocated", req.count);
-
-    for (uint32_t i = 0; i < CAM_VIDEO_BUFFER_COUNT; i++) {
-        struct v4l2_buffer buf = {
-            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-            .memory = V4L2_MEMORY_MMAP,
-            .index = i,
-        };
-
-        ESP_RETURN_ON_FALSE(ioctl(s->fd, VIDIOC_QUERYBUF, &buf) == 0,
-                            ESP_FAIL, TAG, "Query buffer[%" PRIu32 "] failed, errno=%d", i, errno);
-
-        s->buffers[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, buf.m.offset);
-        ESP_RETURN_ON_FALSE(s->buffers[i] != MAP_FAILED,
-                            ESP_ERR_NO_MEM, TAG, "Map buffer[%" PRIu32 "] failed", i);
-        s->buffer_lengths[i] = buf.length;
-
-        ESP_RETURN_ON_FALSE(ioctl(s->fd, VIDIOC_QBUF, &buf) == 0,
-                            ESP_FAIL, TAG, "Queue buffer[%" PRIu32 "] failed, errno=%d", i, errno);
-    }
-
-    ESP_LOGI(TAG, "Video buffers queued: %d", CAM_VIDEO_BUFFER_COUNT);
-    return ESP_OK;
-}
-
-static esp_err_t open_video_stream(video_stream_t *s)
-{
-    struct v4l2_capability capability = {};
-
-    s->fd = open(CAM_VIDEO_DEVICE, O_RDWR);
-    ESP_RETURN_ON_FALSE(s->fd >= 0, ESP_FAIL, TAG, "Open %s failed, errno=%d", CAM_VIDEO_DEVICE, errno);
-
-    ESP_RETURN_ON_FALSE(ioctl(s->fd, VIDIOC_QUERYCAP, &capability) == 0,
-                        ESP_FAIL, TAG, "Query capability failed, errno=%d", errno);
-    ESP_LOGI(TAG, "Video device: driver=%s, card=%s, bus=%s",
-             capability.driver, capability.card, capability.bus_info);
-    log_video_formats(s->fd);
-
-    ESP_RETURN_ON_ERROR(set_center_crop(s->fd), TAG, "Set crop failed");
-    ESP_RETURN_ON_ERROR(set_preview_format(s), TAG, "Set preview format failed");
-    ESP_RETURN_ON_ERROR(set_preview_fps(s->fd), TAG, "Set FPS failed");
-    ESP_RETURN_ON_ERROR(request_and_queue_buffers(s), TAG, "Queue buffers failed");
-
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ESP_RETURN_ON_FALSE(ioctl(s->fd, VIDIOC_STREAMON, &type) == 0,
-                        ESP_FAIL, TAG, "Start stream failed, errno=%d", errno);
-    s->streaming = true;
-    ESP_LOGI(TAG, "Video stream started");
-
-    return ESP_OK;
-}
-
-static inline void rgb565_to_lcd_bgr888(const uint8_t *src, uint8_t *dst)
-{
+#if DISPLAY_PANEL_BITS_PER_PIXEL == 16
+    dst[0] = src[0];
+    dst[1] = src[1];
+#else
     uint16_t rgb565 = src[0] | ((uint16_t)src[1] << 8);
-    dst[0] = (uint8_t)(((rgb565 & 0x001f) * 255) / 31);
-    dst[1] = (uint8_t)((((rgb565 >> 5) & 0x003f) * 255) / 63);
-    dst[2] = (uint8_t)((((rgb565 >> 11) & 0x001f) * 255) / 31);
+    uint8_t r = (uint8_t)((rgb565 >> 11) & 0x1f);
+    uint8_t g = (uint8_t)((rgb565 >> 5) & 0x3f);
+    uint8_t b = (uint8_t)(rgb565 & 0x1f);
+
+    dst[0] = (uint8_t)((r << 3) | (r >> 2));
+    dst[1] = (uint8_t)((g << 2) | (g >> 4));
+    dst[2] = (uint8_t)((b << 3) | (b >> 2));
+#endif
 }
 
 static void copy_video_rgb565_to_lcd(const uint8_t *src, uint8_t *dst, size_t pixels)
 {
-    for (size_t i = 0; i < pixels; i++) {
-        rgb565_to_lcd_bgr888(src, dst);
+    for (size_t i = 0; i < pixels; i++)
+    {
+        rgb565_to_lcd(src, dst);
         src += CAM_PREVIEW_BYTES_PER_PIXEL;
         dst += CAM_LCD_BYTES_PER_PIXEL;
     }
@@ -381,130 +133,281 @@ static void copy_video_rgb565_to_lcd(const uint8_t *src, uint8_t *dst, size_t pi
 
 static void crop_center_rgb565_to_lcd(const uint8_t *src, uint32_t src_w, uint32_t src_h, uint8_t *dst)
 {
-    const uint32_t crop_x = (src_w - LCD_H_RES) / 2;
-    const uint32_t crop_y = (src_h - LCD_V_RES) / 2;
+    const uint32_t crop_x = (src_w - DISPLAY_PANEL_H_RES) / 2;
+    const uint32_t crop_y = (src_h - DISPLAY_PANEL_V_RES) / 2;
 
-    for (uint32_t y = 0; y < LCD_V_RES; y++) {
+    for (uint32_t y = 0; y < DISPLAY_PANEL_V_RES; y++)
+    {
         const uint8_t *src_row = src + (((size_t)(crop_y + y) * src_w + crop_x) * CAM_PREVIEW_BYTES_PER_PIXEL);
-        uint8_t *dst_row = dst + ((size_t)y * LCD_H_RES * CAM_LCD_BYTES_PER_PIXEL);
-        copy_video_rgb565_to_lcd(src_row, dst_row, LCD_H_RES);
+        uint8_t *dst_row = dst + ((size_t)y * DISPLAY_PANEL_H_RES * CAM_LCD_BYTES_PER_PIXEL);
+        copy_video_rgb565_to_lcd(src_row, dst_row, DISPLAY_PANEL_H_RES);
     }
+}
+
+static esp_err_t init_ppa_srm(void)
+{
+    if (ppa_disabled)
+    {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (ppa_srm != NULL)
+    {
+        return ESP_OK;
+    }
+
+    ppa_client_config_t config = {
+        .oper_type = PPA_OPERATION_SRM,
+        .max_pending_trans_num = 1,
+        .data_burst_length = PPA_DATA_BURST_LENGTH_8,
+    };
+    esp_err_t ret = ppa_register_client(&config, &ppa_srm);
+    if (ret == ESP_OK)
+    {
+        ESP_LOGI(TAG, "PPA SRM enabled, burst=8, display=%d FPS", CAM_DISPLAY_FPS);
+    }
+    return ret;
+}
+
+static bool calculate_ppa_fill_geometry(uint32_t src_w, uint32_t src_h,
+                                        uint32_t *crop_w, uint32_t *crop_h,
+                                        float *scale)
+{
+    const uint32_t dst_w_scaled =
+        DISPLAY_PANEL_H_RES * CAM_PPA_SCALE_FRACTION_STEPS;
+    const uint32_t dst_h_scaled =
+        DISPLAY_PANEL_V_RES * CAM_PPA_SCALE_FRACTION_STEPS;
+    uint32_t min_steps_x = (dst_w_scaled + src_w - 1) / src_w;
+    uint32_t min_steps_y = (dst_h_scaled + src_h - 1) / src_h;
+    uint32_t min_steps = min_steps_x > min_steps_y ? min_steps_x : min_steps_y;
+    if (min_steps == 0) {
+        min_steps = 1;
+    }
+
+    for (uint32_t steps = min_steps;
+         steps <= CAM_PPA_SCALE_MAX_STEPS;
+         ++steps) {
+        if ((dst_w_scaled % steps) != 0 || (dst_h_scaled % steps) != 0) {
+            continue;
+        }
+
+        uint32_t candidate_w = dst_w_scaled / steps;
+        uint32_t candidate_h = dst_h_scaled / steps;
+        if (candidate_w <= src_w && candidate_h <= src_h) {
+            *crop_w = candidate_w;
+            *crop_h = candidate_h;
+            *scale = (float)steps / (float)CAM_PPA_SCALE_FRACTION_STEPS;
+            return true;
+        }
+    }
+    return false;
 }
 
 static void scale_center_rgb565_to_lcd(const uint8_t *src, uint32_t src_w, uint32_t src_h, uint8_t *dst)
 {
-    uint32_t crop = src_h;
     uint32_t crop_x = 0;
     uint32_t crop_y = 0;
+    uint32_t crop_w = src_w;
+    uint32_t crop_h = src_h;
 
-    if (src_w > src_h) {
-        crop_x = (src_w - src_h) / 2;
-    } else if (src_h > src_w) {
-        crop = src_w;
-        crop_y = (src_h - src_w) / 2;
+    if ((uint64_t)src_w * DISPLAY_PANEL_V_RES > (uint64_t)src_h * DISPLAY_PANEL_H_RES)
+    {
+        crop_w = (uint32_t)(((uint64_t)src_h * DISPLAY_PANEL_H_RES) / DISPLAY_PANEL_V_RES);
+        crop_x = (src_w - crop_w) / 2;
+    }
+    else if ((uint64_t)src_w * DISPLAY_PANEL_V_RES < (uint64_t)src_h * DISPLAY_PANEL_H_RES)
+    {
+        crop_h = (uint32_t)(((uint64_t)src_w * DISPLAY_PANEL_V_RES) / DISPLAY_PANEL_H_RES);
+        crop_y = (src_h - crop_h) / 2;
     }
 
-    for (uint32_t y = 0; y < LCD_V_RES; y++) {
-        uint32_t src_y = crop_y + (uint32_t)(((uint64_t)y * crop) / LCD_V_RES);
-        for (uint32_t x = 0; x < LCD_H_RES; x++) {
-            uint32_t src_x = crop_x + (uint32_t)(((uint64_t)x * crop) / LCD_H_RES);
-            const uint8_t *s = src + ((size_t)src_y * src_w + src_x) * CAM_PREVIEW_BYTES_PER_PIXEL;
-            uint8_t *d = dst + ((size_t)y * LCD_H_RES + x) * CAM_LCD_BYTES_PER_PIXEL;
+    uint32_t ppa_crop_w;
+    uint32_t ppa_crop_h;
+    float ppa_scale;
+    bool ppa_geometry_valid = calculate_ppa_fill_geometry(
+        src_w, src_h, &ppa_crop_w, &ppa_crop_h, &ppa_scale);
+    esp_err_t ppa_ret =
+        ppa_geometry_valid ? init_ppa_srm() : ESP_ERR_NOT_SUPPORTED;
+    if (ppa_ret == ESP_OK)
+    {
+        uint32_t ppa_crop_x = (src_w - ppa_crop_w) / 2;
+        uint32_t ppa_crop_y = (src_h - ppa_crop_h) / 2;
+        ppa_srm_oper_config_t config = {
+            .in = {
+                .buffer = src,
+                .pic_w = src_w,
+                .pic_h = src_h,
+                .block_w = ppa_crop_w,
+                .block_h = ppa_crop_h,
+                .block_offset_x = ppa_crop_x,
+                .block_offset_y = ppa_crop_y,
+                .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+            },
+            .out = {
+                .buffer = dst,
+                .buffer_size = (size_t)DISPLAY_PANEL_H_RES * DISPLAY_PANEL_V_RES * CAM_LCD_BYTES_PER_PIXEL,
+                .pic_w = DISPLAY_PANEL_H_RES,
+                .pic_h = DISPLAY_PANEL_V_RES,
+                .block_offset_x = 0,
+                .block_offset_y = 0,
+                .srm_cm = CAM_PPA_LCD_COLOR_MODE,
+            },
+            .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+            .scale_x = ppa_scale,
+            .scale_y = ppa_scale,
+            .rgb_swap = false,
+            .byte_swap = false,
+            .mode = PPA_TRANS_MODE_BLOCKING,
+        };
 
-            rgb565_to_lcd_bgr888(s, d);
+        if (!ppa_geometry_logged) {
+            ESP_LOGI(TAG,
+                     "PPA fill: %ux%u crop %ux%u at (%u,%u), scale=%.4f -> %ux%u",
+                     src_w, src_h, ppa_crop_w, ppa_crop_h,
+                     ppa_crop_x, ppa_crop_y, ppa_scale,
+                     DISPLAY_PANEL_H_RES, DISPLAY_PANEL_V_RES);
+            ppa_geometry_logged = true;
+        }
+        ppa_ret = ppa_do_scale_rotate_mirror(ppa_srm, &config);
+        if (ppa_ret == ESP_OK)
+        {
+            return;
+        }
+    }
+
+    ppa_disabled = true;
+    if (!ppa_disable_logged)
+    {
+        ESP_LOGW(TAG, "PPA scale failed: %s, fallback to CPU scale", esp_err_to_name(ppa_ret));
+        ppa_disable_logged = true;
+    }
+
+    for (uint32_t y = 0; y < DISPLAY_PANEL_V_RES; y++)
+    {
+        uint32_t src_y = crop_y + (uint32_t)(((uint64_t)y * crop_h) / DISPLAY_PANEL_V_RES);
+        for (uint32_t x = 0; x < DISPLAY_PANEL_H_RES; x++)
+        {
+            uint32_t src_x = crop_x + (uint32_t)(((uint64_t)x * crop_w) / DISPLAY_PANEL_H_RES);
+            const uint8_t *s = src + ((size_t)src_y * src_w + src_x) * CAM_PREVIEW_BYTES_PER_PIXEL;
+            uint8_t *d = dst + ((size_t)y * DISPLAY_PANEL_H_RES + x) * CAM_LCD_BYTES_PER_PIXEL;
+
+            rgb565_to_lcd(s, d);
         }
     }
 }
 
 static void clean_lcd_bottom_edge(uint8_t *lcd_fb)
 {
-    if (CAM_LCD_BOTTOM_GUARD_LINES == 0 || CAM_LCD_BOTTOM_GUARD_LINES >= LCD_V_RES) {
+    if (CAM_LCD_BOTTOM_GUARD_LINES == 0 || CAM_LCD_BOTTOM_GUARD_LINES >= DISPLAY_PANEL_V_RES)
+    {
         return;
     }
 
-    const size_t line_bytes = LCD_H_RES * CAM_LCD_BYTES_PER_PIXEL;
-    uint8_t *guard = lcd_fb + ((size_t)(LCD_V_RES - CAM_LCD_BOTTOM_GUARD_LINES) * line_bytes);
+    const size_t line_bytes = DISPLAY_PANEL_H_RES * CAM_LCD_BYTES_PER_PIXEL;
+    uint8_t *guard = lcd_fb + ((size_t)(DISPLAY_PANEL_V_RES - CAM_LCD_BOTTOM_GUARD_LINES) * line_bytes);
     memset(guard, 0, CAM_LCD_BOTTOM_GUARD_LINES * line_bytes);
 }
 
-static esp_err_t draw_video_frame(video_stream_t *s, const uint8_t *video_frame, size_t bytesused)
+static esp_err_t draw_video_frame(const camera_ov2710_frame_t *frame)
 {
-    size_t expected_size = (size_t)s->width * s->height * CAM_PREVIEW_BYTES_PER_PIXEL;
-    ESP_RETURN_ON_FALSE(bytesused >= expected_size, ESP_ERR_INVALID_SIZE,
-                        TAG, "Frame too small: %u < %u", (unsigned)bytesused, (unsigned)expected_size);
+    ESP_RETURN_ON_FALSE(frame->pixel_format == CAMERA_OV2710_PIXEL_FORMAT_RGB565,
+                        ESP_ERR_NOT_SUPPORTED, TAG, "Camera frame is not RGB565");
+    size_t expected_size = (size_t)frame->width * frame->height * CAM_PREVIEW_BYTES_PER_PIXEL;
+    ESP_RETURN_ON_FALSE(frame->bytes_used >= expected_size, ESP_ERR_INVALID_SIZE,
+                        TAG, "Frame too small: %u < %u",
+                        (unsigned)frame->bytes_used, (unsigned)expected_size);
+    const uint8_t *video_frame = frame->data;
 
-    uint8_t *lcd_fb = lcd_jd9365_get_next_frame_buffer(&lcd);
+    uint8_t *lcd_fb = display_panel_get_next_frame_buffer(&lcd);
     ESP_RETURN_ON_FALSE(lcd_fb, ESP_ERR_INVALID_STATE, TAG, "LCD framebuffer is NULL");
 
-    if (s->width == LCD_H_RES && s->height == LCD_V_RES) {
-        copy_video_rgb565_to_lcd(video_frame, lcd_fb, (size_t)LCD_H_RES * LCD_V_RES);
-    } else if (s->width >= LCD_H_RES && s->height >= LCD_V_RES && s->height == LCD_V_RES) {
-        crop_center_rgb565_to_lcd(video_frame, s->width, s->height, lcd_fb);
-    } else {
-        scale_center_rgb565_to_lcd(video_frame, s->width, s->height, lcd_fb);
+    if (frame->width == DISPLAY_PANEL_H_RES && frame->height == DISPLAY_PANEL_V_RES)
+    {
+        copy_video_rgb565_to_lcd(video_frame, lcd_fb, (size_t)DISPLAY_PANEL_H_RES * DISPLAY_PANEL_V_RES);
+    }
+    else if (frame->width >= DISPLAY_PANEL_H_RES &&
+             frame->height >= DISPLAY_PANEL_V_RES &&
+             frame->height == DISPLAY_PANEL_V_RES)
+    {
+        crop_center_rgb565_to_lcd(video_frame, frame->width, frame->height, lcd_fb);
+    }
+    else
+    {
+        scale_center_rgb565_to_lcd(video_frame, frame->width, frame->height, lcd_fb);
     }
 
     clean_lcd_bottom_edge(lcd_fb);
-    ESP_RETURN_ON_ERROR(esp_cache_msync(lcd_fb,
-                                        LCD_H_RES * LCD_V_RES * CAM_LCD_BYTES_PER_PIXEL,
+    const size_t guard_bytes = (size_t)DISPLAY_PANEL_H_RES * CAM_LCD_BOTTOM_GUARD_LINES * CAM_LCD_BYTES_PER_PIXEL;
+    uint8_t *guard = lcd_fb + ((size_t)(DISPLAY_PANEL_V_RES - CAM_LCD_BOTTOM_GUARD_LINES) *
+                              DISPLAY_PANEL_H_RES * CAM_LCD_BYTES_PER_PIXEL);
+    ESP_RETURN_ON_ERROR(esp_cache_msync(guard, guard_bytes,
                                         ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED),
-                        TAG, "LCD framebuffer cache sync failed");
+                        TAG, "LCD guard cache sync failed");
 
-    ESP_RETURN_ON_ERROR(lcd_jd9365_draw_bitmap(&lcd, 0, 0, LCD_H_RES, LCD_V_RES, lcd_fb),
+    ESP_RETURN_ON_ERROR(display_panel_draw_bitmap(&lcd, 0, 0, DISPLAY_PANEL_H_RES,
+                                                  DISPLAY_PANEL_V_RES, lcd_fb),
                         TAG, "LCD draw failed");
 
     return ESP_OK;
 }
 
-static esp_err_t preview_loop(video_stream_t *s)
+static esp_err_t preview_loop(void)
 {
     uint32_t frame_count = 0;
     int64_t fps_start_us = esp_timer_get_time();
+    int64_t next_display_us = fps_start_us;
 
-    while (1) {
-        struct v4l2_buffer buf = {
-            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-            .memory = V4L2_MEMORY_MMAP,
-        };
+    while (1)
+    {
+        camera_ov2710_frame_t frame;
+        ESP_RETURN_ON_ERROR(camera_ov2710_get_frame(camera, &frame),
+                            TAG, "Get camera frame failed");
 
-        ESP_RETURN_ON_FALSE(ioctl(s->fd, VIDIOC_DQBUF, &buf) == 0,
-                            ESP_FAIL, TAG, "DQBUF failed, errno=%d", errno);
-
-        if ((buf.flags & V4L2_BUF_FLAG_DONE) && buf.index < CAM_VIDEO_BUFFER_COUNT) {
-            esp_err_t ret = draw_video_frame(s, (const uint8_t *)s->buffers[buf.index], buf.bytesused);
-            if (ret != ESP_OK) {
-                ESP_LOGW(TAG, "Draw frame failed: %s", esp_err_to_name(ret));
-            }
-
-            frame_count++;
+        if (!frame.error)
+        {
             int64_t now_us = esp_timer_get_time();
-            if (now_us - fps_start_us >= 2000000) {
-                float fps = (float)frame_count * 1000000.0f / (float)(now_us - fps_start_us);
-                ESP_LOGI(TAG, "Preview FPS: %.1f, last bytes=%" PRIu32, fps, buf.bytesused);
-                frame_count = 0;
-                fps_start_us = now_us;
+            if (now_us >= next_display_us)
+            {
+                esp_err_t ret = draw_video_frame(&frame);
+                if (ret != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "Draw frame failed: %s", esp_err_to_name(ret));
+                }
+                else
+                {
+                    frame_count++;
+                }
+
+                now_us = esp_timer_get_time();
+                next_display_us = now_us + CAM_DISPLAY_FRAME_INTERVAL_US;
+                if (now_us - fps_start_us >= 2000000)
+                {
+                    float fps = (float)frame_count * 1000000.0f / (float)(now_us - fps_start_us);
+                    ESP_LOGI(TAG, "Display FPS: %.1f, last bytes=%u",
+                             fps, (unsigned)frame.bytes_used);
+                    frame_count = 0;
+                    fps_start_us = now_us;
+                }
             }
-        } else if (buf.flags & V4L2_BUF_FLAG_ERROR) {
+        }
+        else
+        {
             ESP_LOGW(TAG, "Video buffer has error flag");
         }
 
-        ESP_RETURN_ON_FALSE(ioctl(s->fd, VIDIOC_QBUF, &buf) == 0,
-                            ESP_FAIL, TAG, "QBUF failed, errno=%d", errno);
+        ESP_RETURN_ON_ERROR(camera_ov2710_return_frame(camera, &frame),
+                            TAG, "Return camera frame failed");
         vTaskDelay(1);
     }
 }
 
 void app_main(void)
 {
-    i2c_master_bus_handle_t i2c_bus = NULL;
+    ESP_LOGI(TAG, "CAM ESP Video example");
+    camera_ov2710_config_t camera_config = CAMERA_OV2710_1080P_CONFIG();
 
-    ESP_ERROR_CHECK(init_board_i2c(&i2c_bus));
-    ESP_ERROR_CHECK(init_sgm38121(i2c_bus));
-    ESP_ERROR_CHECK(esp_io_expander_new_i2c_xl9555(i2c_bus, XL9555_I2C_ADDR, &expander));
-    ESP_ERROR_CHECK(init_mipi_phy_ldo());
-    ESP_ERROR_CHECK(init_video_system(i2c_bus));
+    ESP_ERROR_CHECK(t_panel_p4_bsp_init(&bsp));
+    ESP_ERROR_CHECK(camera_ov2710_init(&bsp, &camera_config, &camera));
     ESP_ERROR_CHECK(init_lcd());
     ESP_ERROR_CHECK(show_lcd_test_pattern());
-    ESP_ERROR_CHECK(open_video_stream(&stream));
-    ESP_ERROR_CHECK(preview_loop(&stream));
+    ESP_ERROR_CHECK(preview_loop());
 }

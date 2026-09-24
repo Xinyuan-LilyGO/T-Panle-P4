@@ -75,6 +75,7 @@ extern "C"
     int lora_app_set_spreading_factor(uint8_t spreading_factor);
     int lora_app_set_coding_rate(uint8_t coding_rate);
     int lora_app_set_output_power(int8_t power_dbm);
+    int8_t lora_app_get_max_output_power(void);
     int lora_app_set_current_limit(float current_ma);
     int lora_app_set_sync_word(uint8_t sync_word);
     int lora_app_set_preamble_length(size_t preamble_len);

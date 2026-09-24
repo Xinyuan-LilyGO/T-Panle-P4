@@ -85,11 +85,15 @@ typedef enum {
     PAGE_START = 0,
     PAGE_HOME,
     PAGE_MUSIC,
+    PAGE_RECORD,
     PAGE_CAMERA,
     PAGE_LORA,
     PAGE_FILE,
     PAGE_BMU,
     PAGE_SET,
+    PAGE_SENSOR,
+    PAGE_SELF_TEST,
+    PAGE_SELF_TEST_RUN,
     PAGE_SIZE,
 } PageType;
 
@@ -174,6 +178,8 @@ typedef enum {
     INIT_AUDIO_ERROR = (1 << 3),
     INIT_SLAVE_ERROR = (1 << 4),
     INIT_CAMERA_ERROR = (1 << 5),
+    INIT_SENSOR_ERROR = (1 << 6),
+    INIT_MOTOR_ERROR = (1 << 7),
     INIT_ERROR_SIZE,
 } init_error_t;
 extern init_error_t s_init_error;
@@ -227,16 +233,22 @@ device_switch_t *get_device_switch(void);
 #define UI_LINE        0x22304A
 #define UI_TEXT        0xEAF7FF
 #define UI_MUTED       0x7F8EA3
-#define UI_PRIMARY     0x00F5FF
-#define UI_SECONDARY   0xFF2BD6
+#define UI_PRIMARY     0x4CC9F0
+#define UI_SECONDARY   0x58D68D
 #define UI_WARN        0xFFE66D
-#define UI_OK          0x39FF88
-#define UI_ERROR       0xFF3B5C
+#define UI_OK          0x00ff00
+#define UI_ERROR       0xff0027
 
-/*
- * LV_FONT_DECLARE(your_font);
- * LV_IMG_DECLARE(your_picture);
- */
+#define UI_COLOR_1     0x192234
+#define UI_COLOR_2     0x223047
+#define UI_COLOR_3     0x33445F
+#define UI_COLOR_4     0xF5F7FC
+#define UI_COLOR_5     0xACB7C9
+#define UI_COLOR_6     0x087E73
+#define UI_COLOR_7     0x153E3A
+#define UI_COLOR_8     0x58D68D
+#define UI_COLOR_9     0xFFC857
+#define UI_COLOR_10     0xFF4D6D
 
 #ifdef __cplusplus
 }

@@ -122,17 +122,6 @@ static void gesture_event_cb(lv_event_t *e);
 static void timer_manager_callback(lv_timer_t *timer);
 static void process_ui_messages(void);
 
-static lv_obj_t *create_info_card(lv_obj_t *parent, const char *title, const char *value, lv_coord_t x, lv_coord_t y);
-
-static void anim_size_width_cb(void *var, int32_t v);
-static void anim_size_height_cb(void *var, int32_t v);
-static void anim_x_cb(void *var, int32_t v);
-static void anim_y_cb(void *var, int32_t v);
-static void anim_zoom(lv_obj_t *obj, uint32_t duration, uint32_t start_width, uint32_t end_width, uint32_t start_height, uint32_t end_height);
-static void anim_height(lv_obj_t *obj, uint32_t duration, uint32_t start_height, uint32_t end_height);
-static void anim_y(lv_obj_t *obj, uint32_t duration, uint32_t start_y, uint32_t end_y);
-static void anim_x(lv_obj_t *obj, uint32_t duration, uint32_t start_x, uint32_t end_x);
-
 #if defined(LV_PM_PLATFORM_RTTHREAD)
 static rt_err_t platform_display_init(void)
 {
@@ -293,7 +282,8 @@ static uint32_t platform_tick_to_ms(ui_tick_t tick)
 
 static void platform_delay_ms(uint32_t ms)
 {
-    vTaskDelay(pdMS_TO_TICKS(ms));
+    TickType_t ticks = pdMS_TO_TICKS(ms);
+    vTaskDelay(ticks > 0 ? ticks : 1);
 }
 
 #else
@@ -836,87 +826,23 @@ static void gesture_event_cb(lv_event_t *e)
         return;
     }
 
+#if defined(LVGL_VERSION_MAJOR) && (LVGL_VERSION_MAJOR >= 9)
+    lv_obj_t *target = lv_event_get_target_obj(e);
+#else
+    lv_obj_t *target = (lv_obj_t *)lv_event_get_target(e);
+#endif
+    if (target != RT_NULL && target != page->root &&
+        (lv_obj_has_flag(target, LV_OBJ_FLAG_CLICKABLE) ||
+         lv_obj_has_flag(target, LV_OBJ_FLAG_SCROLLABLE)))
+    {
+        return;
+    }
+
     GestureDirection direction = gesture_from_lvgl(e);
     if (direction != GESTURE_NONE)
     {
         page->on_gesture(page, direction);
     }
-}
-
-static void anim_size_width_cb(void *var, int32_t v)
-{
-    lv_obj_set_width((lv_obj_t *)var, v);
-}
-
-static void anim_size_height_cb(void *var, int32_t v)
-{
-    lv_obj_set_height((lv_obj_t *)var, v);
-}
-
-static void anim_x_cb(void *var, int32_t v)
-{
-    lv_obj_set_x((lv_obj_t *)var, v);
-}
-
-static void anim_y_cb(void *var, int32_t v)
-{
-    lv_obj_set_y((lv_obj_t *)var, v);
-}
-
-static void anim_zoom(lv_obj_t *obj, uint32_t duration, uint32_t start_width, uint32_t end_width, uint32_t start_height, uint32_t end_height)
-{
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, obj);
-    lv_anim_set_values(&a, start_width, end_width);
-    lv_anim_set_exec_cb(&a, anim_size_width_cb);
-    lv_anim_set_duration(&a, duration);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-    lv_anim_start(&a);
-
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, obj);
-    lv_anim_set_values(&a, start_height, end_height);
-    lv_anim_set_exec_cb(&a, anim_size_height_cb);
-    lv_anim_set_duration(&a, duration);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-    lv_anim_start(&a);
-}
-
-static void anim_height(lv_obj_t *obj, uint32_t duration, uint32_t start_height, uint32_t end_height)
-{
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, obj);
-    lv_anim_set_values(&a, start_height, end_height);
-    lv_anim_set_duration(&a, duration);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-    lv_anim_set_exec_cb(&a, anim_size_height_cb);
-    lv_anim_start(&a);
-}
-
-static void anim_y(lv_obj_t *obj, uint32_t duration, uint32_t start_y, uint32_t end_y)
-{
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, obj);
-    lv_anim_set_values(&a, start_y, end_y);
-    lv_anim_set_exec_cb(&a, anim_y_cb);
-    lv_anim_set_duration(&a, duration);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-    lv_anim_start(&a);
-}
-
-static void anim_x(lv_obj_t *obj, uint32_t duration, uint32_t start_x, uint32_t end_x)
-{
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, obj);
-    lv_anim_set_values(&a, start_x, end_x);
-    lv_anim_set_exec_cb(&a, anim_x_cb);
-    lv_anim_set_duration(&a, duration);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-    lv_anim_start(&a);
 }
 
 device_switch_t *get_device_switch(void)

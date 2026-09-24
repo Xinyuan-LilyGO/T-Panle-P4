@@ -1,9 +1,10 @@
 #include "lora_app.h"
 
+#include <inttypes.h>
 #include <string.h>
 
 #include "radio_esp32p4_hal.h"
-#include "T_Panle_P4_board_config.h"
+#include "board_config.h"
 
 static const char *TAG = "lora_app";
 
@@ -13,9 +14,103 @@ static PhysicalLayer *s_radio = nullptr;
 static lora_app_config_t s_config = {};
 static bool s_config_valid = false;
 static bool s_started = false;
+static bool s_crc_enabled = true;
 static lora_app_irq_cb_t s_irq_callback = nullptr;
 static void *s_irq_user_data = nullptr;
 static volatile uint32_t s_irq_events = 0;
+
+#define LR2021_SUB_GHZ_MAX_POWER_DBM 22
+#define LR2021_24_GHZ_MAX_POWER_DBM 5
+#define LR2021_24_GHZ_DEFAULT_BANDWIDTH_KHZ 406.0f
+
+static LR2021PaTableEntry_t paOptTableLf[RADIOLIB_LR2021_PA_TABLE_LEN] = {
+    // The 915 MHz reference table only specifies 10 to 22 dBm.
+    // Keep the RadioLib defaults for -9 to +9 dBm.
+    {.paDutyCycle = 1, .paSlices = 1, .paVal = 8},  // -9 dBm
+    {.paDutyCycle = 2, .paSlices = 2, .paVal = 1},  // -8 dBm
+    {.paDutyCycle = 2, .paSlices = 2, .paVal = 3},  // -7 dBm
+    {.paDutyCycle = 2, .paSlices = 2, .paVal = 5},  // -6 dBm
+    {.paDutyCycle = 1, .paSlices = 2, .paVal = 13}, // -5 dBm
+    {.paDutyCycle = 2, .paSlices = 1, .paVal = 13}, // -4 dBm
+    {.paDutyCycle = 2, .paSlices = 2, .paVal = 11}, // -3 dBm
+    {.paDutyCycle = 2, .paSlices = 2, .paVal = 13}, // -2 dBm
+    {.paDutyCycle = 3, .paSlices = 1, .paVal = 12}, // -1 dBm
+    {.paDutyCycle = 1, .paSlices = 1, .paVal = 18}, //  0 dBm
+    {.paDutyCycle = 1, .paSlices = 1, .paVal = 20}, //  1 dBm
+    {.paDutyCycle = 1, .paSlices = 1, .paVal = 23}, //  2 dBm
+    {.paDutyCycle = 1, .paSlices = 1, .paVal = 27}, //  3 dBm
+    {.paDutyCycle = 1, .paSlices = 1, .paVal = 33}, //  4 dBm
+    {.paDutyCycle = 1, .paSlices = 2, .paVal = 26}, //  5 dBm
+    {.paDutyCycle = 1, .paSlices = 2, .paVal = 31}, //  6 dBm
+    {.paDutyCycle = 1, .paSlices = 3, .paVal = 27}, //  7 dBm
+    {.paDutyCycle = 1, .paSlices = 1, .paVal = 37}, //  8 dBm
+    {.paDutyCycle = 1, .paSlices = 2, .paVal = 40}, //  9 dBm
+    // 10 to 22 dBm use the supplied 915 MHz values. paVal = TX_PARAM * 2.
+    {.paDutyCycle = 2, .paSlices = 1, .paVal = 32}, // 10 dBm
+    {.paDutyCycle = 2, .paSlices = 2, .paVal = 32}, // 11 dBm
+    {.paDutyCycle = 5, .paSlices = 1, .paVal = 30}, // 12 dBm
+    {.paDutyCycle = 4, .paSlices = 3, .paVal = 31}, // 13 dBm
+    {.paDutyCycle = 4, .paSlices = 2, .paVal = 34}, // 14 dBm
+    {.paDutyCycle = 5, .paSlices = 4, .paVal = 33}, // 15 dBm
+    {.paDutyCycle = 4, .paSlices = 4, .paVal = 36}, // 16 dBm
+    {.paDutyCycle = 5, .paSlices = 6, .paVal = 36}, // 17 dBm
+    {.paDutyCycle = 5, .paSlices = 6, .paVal = 38}, // 18 dBm
+    {.paDutyCycle = 6, .paSlices = 6, .paVal = 39}, // 19 dBm
+    {.paDutyCycle = 6, .paSlices = 6, .paVal = 41}, // 20 dBm
+    {.paDutyCycle = 7, .paSlices = 7, .paVal = 42}, // 21 dBm
+    {.paDutyCycle = 7, .paSlices = 6, .paVal = 44}, // 22 dBm
+};
+
+static int8_t lora_app_max_output_power(void)
+{
+    if (s_config.chip != LORA_APP_CHIP_LR2021)
+    {
+        return 22;
+    }
+    return s_config.freq_mhz > RADIOLIB_LR2021_LF_CUTOFF_FREQ ? LR2021_24_GHZ_MAX_POWER_DBM : LR2021_SUB_GHZ_MAX_POWER_DBM;
+}
+
+static bool lora_app_lr2021_is_high_frequency(float freq_mhz)
+{
+    return freq_mhz > RADIOLIB_LR2021_LF_CUTOFF_FREQ;
+}
+
+static int lora_app_lr2021_configure_rf_switch(LR2021 *radio)
+{
+    static const uint32_t rf_switch_pins[Module::RFSWITCH_MAX_PINS] = {
+        RADIOLIB_NC,
+        RADIOLIB_LR2021_DIO6,
+        RADIOLIB_LR2021_DIO7,
+        RADIOLIB_NC,
+        RADIOLIB_NC,
+    };
+    static const Module::RfSwitchMode_t rf_switch_table[] = {
+        {LR2021::MODE_STBY, {LOW, LOW, LOW}},
+        {LR2021::MODE_RX, {LOW, LOW, LOW}},
+        {LR2021::MODE_TX, {LOW, LOW, LOW}},
+        {LR2021::MODE_RX_HF, {LOW, HIGH, LOW}},
+        {LR2021::MODE_TX_HF, {LOW, LOW, HIGH}},
+        END_OF_MODE_TABLE,
+    };
+
+    radio->setRfSwitchTable(rf_switch_pins, rf_switch_table);
+    ESP_LOGI(TAG, "LR2021 RF switch: DIO6 mask=0x08 (HF RX), DIO7 mask=0x10 (HF TX)");
+    return RADIOLIB_ERR_NONE;
+}
+
+static int lora_app_lr2021_config_paopttable(LR2021 *radio, LR2021PaTableEntry_t *paOptTable, bool highFreq)
+{
+    radio->setPaTable(paOptTable, highFreq);
+    return RADIOLIB_ERR_NONE;
+}
+
+static void lora_app_lr2021_log_pa_status(int8_t power_dbm)
+{
+    ESP_LOGI(TAG, "LR2021 PA configured: %s %.1fMHz %ddBm",
+             s_config.freq_mhz > RADIOLIB_LR2021_LF_CUTOFF_FREQ ? "HF" : "LF",
+             (double)s_config.freq_mhz,
+             power_dbm);
+}
 
 static bool lora_app_has_radio(void)
 {
@@ -120,7 +215,17 @@ extern "C" void lora_app_default_config(lora_app_config_t *config)
         return;
     }
 
+#if defined(SX1276_MODUEL)
     config->chip = LORA_APP_CHIP_SX1276;
+#elif defined(SX1262_MODUEL)
+    config->chip = LORA_APP_CHIP_SX1262;
+#elif defined(LR1121_MODUEL)
+    config->chip = LORA_APP_CHIP_LR1121;
+#elif defined(LR2021_MODUEL)
+    config->chip = LORA_APP_CHIP_LR2021;
+#else
+#error "Please select a LoRa module"
+#endif
     config->spi_sck = SPI_SCK_PIN;
     config->spi_miso = SPI_MISO_PIN;
     config->spi_mosi = SPI_MOSI_PIN;
@@ -134,7 +239,7 @@ extern "C" void lora_app_default_config(lora_app_config_t *config)
     config->spreading_factor = 7;
     config->coding_rate = 5;
     config->sync_word = 0x12;
-    config->output_power_dbm = 16;
+    config->output_power_dbm = config->chip == LORA_APP_CHIP_LR2021 ? LR2021_SUB_GHZ_MAX_POWER_DBM : 16;
     config->preamble_len = 12;
     config->tcxo_voltage = 3.3f;
     config->current_limit_ma = lora_app_default_current_limit(config->chip);
@@ -198,14 +303,34 @@ static int lora_app_begin_radio(const lora_app_config_t *config)
                                                      config->preamble_len,
                                                      config->tcxo_voltage);
     case LORA_APP_CHIP_LR2021:
-        return static_cast<LR2021 *>(s_radio)->begin(config->freq_mhz,
-                                                     config->bandwidth_khz,
-                                                     config->spreading_factor,
-                                                     config->coding_rate,
-                                                     config->sync_word,
-                                                     config->output_power_dbm,
-                                                     config->preamble_len,
-                                                     config->tcxo_voltage);
+    {
+        LR2021 *radio = static_cast<LR2021 *>(s_radio);
+#if defined(LORA_IRQ_DIO_NUM)
+        radio->irqDioNum = LORA_IRQ_DIO_NUM;
+#endif
+        ESP_LOGI(TAG, "LR2021 IRQ route: DIO%u -> MCU GPIO%d",
+                 (unsigned)radio->irqDioNum, config->irq);
+
+        lora_app_lr2021_config_paopttable(radio, paOptTableLf, false);
+
+        int state = radio->begin(config->freq_mhz,
+                                 config->bandwidth_khz,
+                                 config->spreading_factor,
+                                 config->coding_rate,
+                                 config->sync_word,
+                                 config->output_power_dbm,
+                                 config->preamble_len,
+                                 config->tcxo_voltage);
+        if (state == RADIOLIB_ERR_NONE)
+        {
+            state = lora_app_lr2021_configure_rf_switch(radio);
+            if (state == RADIOLIB_ERR_NONE)
+            {
+                lora_app_lr2021_log_pa_status(config->output_power_dbm);
+            }
+        }
+        return state;
+    }
     default:
         return RADIOLIB_ERR_INVALID_FUNCTION;
     }
@@ -260,6 +385,14 @@ extern "C" int lora_app_init(const lora_app_config_t *config)
     if (s_config.current_limit_ma > 0.0f)
     {
         ESP_LOGI(TAG, "current limit %.1fmA", (double)s_config.current_limit_ma);
+    }
+
+    state = lora_app_set_crc(s_crc_enabled);
+    if (state != RADIOLIB_ERR_NONE)
+    {
+        ESP_LOGE(TAG, "restore CRC setting failed, code %d", state);
+        lora_app_stop();
+        return state;
     }
 
     state = s_radio->invertIQ(s_config.invert_iq);
@@ -363,6 +496,7 @@ extern "C" int lora_app_transmit(const uint8_t *data, size_t len)
     }
 
     state = s_radio->transmit(data, len);
+
     ESP_LOGI(TAG, "transmit len:%u state:%d", (unsigned)len, state);
     return state;
 }
@@ -466,12 +600,87 @@ extern "C" int lora_app_set_frequency(float freq_mhz)
         return state;
     }
 
-    state = s_radio->setFrequency(freq_mhz);
-    if (state == RADIOLIB_ERR_NONE)
+    if (s_config.chip == LORA_APP_CHIP_LR2021)
     {
-        s_config.freq_mhz = freq_mhz;
+        bool old_high_frequency = lora_app_lr2021_is_high_frequency(s_config.freq_mhz);
+        bool new_high_frequency = lora_app_lr2021_is_high_frequency(freq_mhz);
+
+        if (old_high_frequency != new_high_frequency)
+        {
+            lora_app_config_t old_config = s_config;
+            lora_app_config_t new_config = s_config;
+            new_config.freq_mhz = freq_mhz;
+            if (new_high_frequency)
+            {
+                new_config.bandwidth_khz = LR2021_24_GHZ_DEFAULT_BANDWIDTH_KHZ;
+                if (new_config.output_power_dbm > LR2021_24_GHZ_MAX_POWER_DBM)
+                {
+                    new_config.output_power_dbm = LR2021_24_GHZ_MAX_POWER_DBM;
+                }
+            }
+
+            ESP_LOGI(TAG,
+                     "LR2021 band switch: %s %.1fMHz -> %s %.1fMHz, reinitialize bw:%.1fkHz power:%ddBm",
+                     old_high_frequency ? "HF" : "LF", (double)s_config.freq_mhz,
+                     new_high_frequency ? "HF" : "LF", (double)freq_mhz,
+                     (double)new_config.bandwidth_khz, new_config.output_power_dbm);
+
+            state = lora_app_init(&new_config);
+            if (state != RADIOLIB_ERR_NONE)
+            {
+                ESP_LOGE(TAG, "LR2021 band switch reinitialize failed, state:%d", state);
+                int restore_state = lora_app_init(&old_config);
+                if (restore_state != RADIOLIB_ERR_NONE)
+                {
+                    ESP_LOGE(TAG, "LR2021 previous band restore failed, state:%d", restore_state);
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "LR2021 restored previous %s %.1fMHz configuration",
+                             old_high_frequency ? "HF" : "LF", (double)old_config.freq_mhz);
+                }
+            }
+            return state;
+        }
+
+        LR2021 *radio = static_cast<LR2021 *>(s_radio);
+        state = radio->standby();
+        if (state != RADIOLIB_ERR_NONE)
+        {
+            ESP_LOGE(TAG, "LR2021 standby before frequency change failed, state:%d", state);
+            return state;
+        }
+        state = lora_app_lr2021_configure_rf_switch(radio);
+        if (state != RADIOLIB_ERR_NONE)
+        {
+            return state;
+        }
     }
-    return state;
+
+    state = s_radio->setFrequency(freq_mhz);
+    if (state != RADIOLIB_ERR_NONE)
+    {
+        ESP_LOGE(TAG, "set frequency %.1fMHz failed, state:%d", (double)freq_mhz, state);
+        return state;
+    }
+
+    s_config.freq_mhz = freq_mhz;
+    if (s_config.chip == LORA_APP_CHIP_LR2021)
+    {
+        int8_t max_power = lora_app_max_output_power();
+        if (s_config.output_power_dbm > max_power)
+        {
+            s_config.output_power_dbm = max_power;
+        }
+        state = s_radio->setOutputPower(s_config.output_power_dbm);
+        if (state != RADIOLIB_ERR_NONE)
+        {
+            ESP_LOGE(TAG, "set output power after frequency change failed, state:%d", state);
+            return state;
+        }
+        lora_app_lr2021_log_pa_status(s_config.output_power_dbm);
+    }
+    return RADIOLIB_ERR_NONE;
 }
 
 extern "C" int lora_app_set_bandwidth(float bandwidth_khz)
@@ -584,12 +793,28 @@ extern "C" int lora_app_set_output_power(int8_t power_dbm)
         return state;
     }
 
+    int8_t max_power = lora_app_max_output_power();
+    if (power_dbm > max_power)
+    {
+        ESP_LOGW(TAG, "Clamp output power %ddBm to %ddBm at %.1fMHz",
+                 power_dbm, max_power, (double)s_config.freq_mhz);
+        power_dbm = max_power;
+    }
     state = s_radio->setOutputPower(power_dbm);
     if (state == RADIOLIB_ERR_NONE)
     {
         s_config.output_power_dbm = power_dbm;
+        if (s_config.chip == LORA_APP_CHIP_LR2021)
+        {
+            lora_app_lr2021_log_pa_status(power_dbm);
+        }
     }
     return state;
+}
+
+extern "C" int8_t lora_app_get_max_output_power(void)
+{
+    return lora_app_max_output_power();
 }
 
 extern "C" int lora_app_set_current_limit(float current_ma)
@@ -658,16 +883,26 @@ extern "C" int lora_app_set_crc(bool enabled)
     switch (s_config.chip)
     {
     case LORA_APP_CHIP_SX1276:
-        return static_cast<SX1276 *>(s_radio)->setCRC(enabled);
+        state = static_cast<SX1276 *>(s_radio)->setCRC(enabled);
+        break;
     case LORA_APP_CHIP_SX1262:
-        return static_cast<SX1262 *>(s_radio)->setCRC(enabled);
+        state = static_cast<SX1262 *>(s_radio)->setCRC(enabled);
+        break;
     case LORA_APP_CHIP_LR1121:
-        return static_cast<LR1121 *>(s_radio)->setCRC(enabled ? 2 : 0);
+        state = static_cast<LR1121 *>(s_radio)->setCRC(enabled ? 2 : 0);
+        break;
     case LORA_APP_CHIP_LR2021:
-        return static_cast<LR2021 *>(s_radio)->setCRC(enabled ? 2 : 0);
+        state = static_cast<LR2021 *>(s_radio)->setCRC(enabled ? 2 : 0);
+        break;
     default:
         return RADIOLIB_ERR_INVALID_FUNCTION;
     }
+
+    if (state == RADIOLIB_ERR_NONE)
+    {
+        s_crc_enabled = enabled;
+    }
+    return state;
 }
 
 extern "C" int lora_app_set_invert_iq(bool enabled)

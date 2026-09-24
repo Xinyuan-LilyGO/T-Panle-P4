@@ -1,9 +1,25 @@
 {
-    "C_Cpp.intelliSenseEngine": "default",
-    "idf.espIdfPathWin": "d:\\Software\\ESP-IDF_5.5.3\\Espressif\\frameworks\\esp-idf-v5.5.3",
-    "idf.openOcdConfigs": [
-        "board/esp32p4-builtin.cfg"
-    ],
-    "idf.portWin": "COM179",
-    "idf.toolsPathWin": "d:\\Software\\ESP-IDF_5.5.3\\Espressif\\tools"
+  "C_Cpp.intelliSenseEngine": "default",
+  "cmake.cmakePath": "D:\\Software\\ESP-IDF_5.5.3\\Espressif\\tools\\tools\\cmake\\3.30.2\\bin\\cmake.exe",
+  "cmake.configureOnOpen": false,
+  "idf.espIdfPathWin": "d:\\Software\\ESP-IDF_5.5.3\\Espressif\\frameworks\\esp-idf-v5.5.3",
+  "idf.adapterTargetName": "esp32p4",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32p4"
+  },
+  "idf.buildPathWin": "${workspaceFolder}\\build\\round-factory",
+  "idf.sdkconfigFilePath": "${workspaceFolder}\\build\\round-factory\\sdkconfig",
+  "idf.cmakeCompilerArgs": [
+    "-G",
+    "Ninja",
+    "-DPYTHON_DEPS_CHECKED=1",
+    "-DESP_PLATFORM=1",
+    "-DT_PANEL_P4_BOARD=round",
+    "-DT_PANEL_P4_EXAMPLE=factory"
+  ],
+  "idf.openOcdConfigs": [
+    "board/esp32p4-builtin.cfg"
+  ],
+  "idf.portWin": "COM209",
+  "idf.toolsPathWin": "d:\\Software\\ESP-IDF_5.5.3\\Espressif\\tools"
 }

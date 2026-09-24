@@ -9,13 +9,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "sdkconfig.h"
 #include "driver/i2c_master.h"
 #include "esp_cache.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_io_expander.h"
+#if CONFIG_T_PANEL_P4_HAS_XL9555
 #include "esp_io_expander_xl9555.h"
+#endif
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -23,9 +26,9 @@
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "core/lv_refr.h"
-#include "lcd_jd9365_driver.h"
-#include "lcd_jd9365_touch.h"
-#include "T_Panle_P4_board_config.h"
+#include "display_panel.h"
+#include "touch_panel.h"
+#include "board_config.h"
 
 
 static const char *TAG = "lvgl_example";
@@ -35,12 +38,12 @@ static const char *TAG = "lvgl_example";
 #define LVGL_BUFFER_LINES 64
 #define ANIM_BOX_SIZE 56
 #define ANIM_X_MIN 40
-#define ANIM_X_MAX (LCD_H_RES - ANIM_BOX_SIZE - 40)
+#define ANIM_X_MAX (DISPLAY_PANEL_H_RES - ANIM_BOX_SIZE - 40)
 #define ANIM_LABEL_UPDATE_PERIOD_MS 200
 #define MAX_DIRTY_AREAS 16
 
-static lcd_driver_t s_lcd;
-static touch_handle_t s_touch;
+static display_panel_t s_lcd;
+static touch_panel_t s_touch;
 static SemaphoreHandle_t s_lvgl_lock;
 static TaskHandle_t s_lvgl_task_handle;
 static lv_obj_t *s_anim_ball;
@@ -53,7 +56,7 @@ static lv_area_t s_dirty_areas[MAX_DIRTY_AREAS];
 static uint32_t s_dirty_area_count;
 static bool s_dirty_full_screen;
 static int32_t s_anim_x;
-static touch_data_t s_last_touch_data;
+static touch_panel_data_t s_last_touch_data;
 
 static esp_err_t board_i2c_init(i2c_master_bus_handle_t *ret_i2c_bus)
 {
@@ -77,7 +80,7 @@ static void lvgl_tick_cb(void *arg)
 
 static size_t lcd_framebuffer_size(void)
 {
-    return (size_t)LCD_H_RES * LCD_V_RES * (LCD_BIT_PER_PIXEL / 8);
+    return (size_t)DISPLAY_PANEL_H_RES * DISPLAY_PANEL_V_RES * (DISPLAY_PANEL_BITS_PER_PIXEL / 8);
 }
 
 static void dirty_area_add(const lv_area_t *area)
@@ -85,8 +88,8 @@ static void dirty_area_add(const lv_area_t *area)
     lv_area_t clipped = {
         .x1 = LV_MAX(area->x1, 0),
         .y1 = LV_MAX(area->y1, 0),
-        .x2 = LV_MIN(area->x2, LCD_H_RES - 1),
-        .y2 = LV_MIN(area->y2, LCD_V_RES - 1),
+        .x2 = LV_MIN(area->x2, DISPLAY_PANEL_H_RES - 1),
+        .y2 = LV_MIN(area->y2, DISPLAY_PANEL_V_RES - 1),
     };
 
     if (clipped.x1 > clipped.x2 || clipped.y1 > clipped.y2)
@@ -99,7 +102,7 @@ static void dirty_area_add(const lv_area_t *area)
         return;
     }
 
-    if (clipped.x1 == 0 && clipped.y1 == 0 && clipped.x2 == LCD_H_RES - 1 && clipped.y2 == LCD_V_RES - 1)
+    if (clipped.x1 == 0 && clipped.y1 == 0 && clipped.x2 == DISPLAY_PANEL_H_RES - 1 && clipped.y2 == DISPLAY_PANEL_V_RES - 1)
     {
         s_dirty_full_screen = true;
         s_dirty_area_count = 0;
@@ -119,11 +122,11 @@ static void dirty_area_add(const lv_area_t *area)
 
 static esp_err_t framebuffer_copy_area(uint8_t *dst_fb, const uint8_t *src_fb, const lv_area_t *area)
 {
-    const size_t pixel_bytes = LCD_BIT_PER_PIXEL / 8;
-    const size_t stride = (size_t)LCD_H_RES * pixel_bytes;
+    const size_t pixel_bytes = DISPLAY_PANEL_BITS_PER_PIXEL / 8;
+    const size_t stride = (size_t)DISPLAY_PANEL_H_RES * pixel_bytes;
     const size_t row_bytes = (size_t)lv_area_get_width(area) * pixel_bytes;
-    uint8_t *dst_start = dst_fb + (((size_t)area->y1 * LCD_H_RES + area->x1) * pixel_bytes);
-    const uint8_t *src_start = src_fb + (((size_t)area->y1 * LCD_H_RES + area->x1) * pixel_bytes);
+    uint8_t *dst_start = dst_fb + (((size_t)area->y1 * DISPLAY_PANEL_H_RES + area->x1) * pixel_bytes);
+    const uint8_t *src_start = src_fb + (((size_t)area->y1 * DISPLAY_PANEL_H_RES + area->x1) * pixel_bytes);
 
     for (int32_t y = area->y1; y <= area->y2; y++)
     {
@@ -137,10 +140,10 @@ static esp_err_t framebuffer_copy_area(uint8_t *dst_fb, const uint8_t *src_fb, c
 
 static esp_err_t framebuffer_msync_area(uint8_t *fb, const lv_area_t *area)
 {
-    const size_t pixel_bytes = LCD_BIT_PER_PIXEL / 8;
-    const size_t stride = (size_t)LCD_H_RES * pixel_bytes;
+    const size_t pixel_bytes = DISPLAY_PANEL_BITS_PER_PIXEL / 8;
+    const size_t stride = (size_t)DISPLAY_PANEL_H_RES * pixel_bytes;
     const size_t row_bytes = (size_t)lv_area_get_width(area) * pixel_bytes;
-    uint8_t *start = fb + (((size_t)area->y1 * LCD_H_RES + area->x1) * pixel_bytes);
+    uint8_t *start = fb + (((size_t)area->y1 * DISPLAY_PANEL_H_RES + area->x1) * pixel_bytes);
     const size_t sync_bytes = ((size_t)(lv_area_get_height(area) - 1) * stride) + row_bytes;
 
     return esp_cache_msync(start, sync_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
@@ -153,8 +156,8 @@ static esp_err_t sync_dirty_areas_to_back_buffer(void)
         lv_area_t full = {
             .x1 = 0,
             .y1 = 0,
-            .x2 = LCD_H_RES - 1,
-            .y2 = LCD_V_RES - 1,
+            .x2 = DISPLAY_PANEL_H_RES - 1,
+            .y2 = DISPLAY_PANEL_V_RES - 1,
         };
         return framebuffer_copy_area(s_lcd_back_framebuffer, s_lcd_front_framebuffer, &full);
     }
@@ -174,10 +177,10 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     static bool logged_done = false;
     const int32_t width = lv_area_get_width(area);
     const int32_t height = lv_area_get_height(area);
-    const size_t pixel_bytes = LCD_BIT_PER_PIXEL / 8;
-    const size_t framebuffer_stride = (size_t)LCD_H_RES * pixel_bytes;
-    const size_t row_bytes = (size_t)width * (LCD_BIT_PER_PIXEL / 8);
-    uint8_t *dst_start = s_lcd_back_framebuffer + (((size_t)area->y1 * LCD_H_RES + area->x1) * pixel_bytes);
+    const size_t pixel_bytes = DISPLAY_PANEL_BITS_PER_PIXEL / 8;
+    const size_t framebuffer_stride = (size_t)DISPLAY_PANEL_H_RES * pixel_bytes;
+    const size_t row_bytes = (size_t)width * (DISPLAY_PANEL_BITS_PER_PIXEL / 8);
+    uint8_t *dst_start = s_lcd_back_framebuffer + (((size_t)area->y1 * DISPLAY_PANEL_H_RES + area->x1) * pixel_bytes);
 
     if (!logged)
     {
@@ -208,7 +211,8 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
 
     if (ret == ESP_OK && lv_display_flush_is_last(disp))
     {
-        ret = lcd_jd9365_draw_bitmap(&s_lcd, 0, 0, LCD_H_RES, LCD_V_RES, s_lcd_back_framebuffer);
+        ret = display_panel_draw_bitmap(&s_lcd, 0, 0, DISPLAY_PANEL_H_RES,
+                                        DISPLAY_PANEL_V_RES, s_lcd_back_framebuffer);
         if (ret == ESP_OK)
         {
             uint8_t *old_front = s_lcd_front_framebuffer;
@@ -231,9 +235,9 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
 
 static void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
-    touch_data_t touch_data = {0};
+    touch_panel_data_t touch_data = {0};
 
-    if (touch_get_multiple_points(&s_touch, &touch_data) == ESP_OK && touch_data.finger_count > 0)
+    if (touch_panel_get_multiple_points(&s_touch, &touch_data) == ESP_OK && touch_data.finger_count > 0)
     {
         s_last_touch_data = touch_data;
         data->point.x = touch_data.points[0].x;
@@ -264,7 +268,7 @@ static esp_err_t lvgl_port_init(void)
 {
     lv_init();
 
-    const size_t draw_buf_size = (size_t)LCD_H_RES * LVGL_BUFFER_LINES * (LCD_BIT_PER_PIXEL / 8);
+    const size_t draw_buf_size = (size_t)DISPLAY_PANEL_H_RES * LVGL_BUFFER_LINES * (DISPLAY_PANEL_BITS_PER_PIXEL / 8);
     void *draw_buf_1 = heap_caps_aligned_alloc(64, draw_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     void *draw_buf_2 = heap_caps_aligned_alloc(64, draw_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     const char *draw_buf_mem = "internal SRAM";
@@ -285,7 +289,7 @@ static esp_err_t lvgl_port_init(void)
     ESP_RETURN_ON_FALSE(draw_buf_1 && draw_buf_2, ESP_ERR_NO_MEM, TAG, "LVGL draw buffer alloc failed");
     ESP_LOGI(TAG, "LVGL draw buffers: %u bytes x2, %s", (unsigned)draw_buf_size, draw_buf_mem);
 
-    lv_display_t *display = lv_display_create(LCD_H_RES, LCD_V_RES);
+    lv_display_t *display = lv_display_create(DISPLAY_PANEL_H_RES, DISPLAY_PANEL_V_RES);
     ESP_RETURN_ON_FALSE(display != NULL, ESP_ERR_NO_MEM, TAG, "LVGL display create failed");
     lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB888);
     lv_display_set_flush_cb(display, lvgl_flush_cb);
@@ -354,21 +358,21 @@ static void touch_label_timer_cb(lv_timer_t *timer)
     else
     {
         uint8_t count = s_last_touch_data.finger_count;
-        if (count > MAX_TOUCH_POINTS)
+        if (count > TOUCH_PANEL_MAX_POINTS)
         {
-            count = MAX_TOUCH_POINTS;
+            count = TOUCH_PANEL_MAX_POINTS;
         }
 
-        for (uint8_t i = 0; i < MAX_TOUCH_POINTS; i++)
+        for (uint8_t i = 0; i < TOUCH_PANEL_MAX_POINTS; i++)
         {
             if (i < count)
             {
                 len += snprintf(buf + len, sizeof(buf) - len,
-                                "P%u: x=%3u y=%3u p=%3u\n",
+                                "P%u: x=%3u y=%3u s=%5u\n",
                                 (unsigned)(i + 1),
                                 (unsigned)s_last_touch_data.points[i].x,
                                 (unsigned)s_last_touch_data.points[i].y,
-                                (unsigned)s_last_touch_data.points[i].pressure);
+                                (unsigned)s_last_touch_data.points[i].strength);
             }
             else
             {
@@ -470,14 +474,16 @@ void app_main(void)
     ESP_ERROR_CHECK(board_i2c_init(&i2c_bus));
 
     esp_io_expander_handle_t expander = NULL;
+#if CONFIG_T_PANEL_P4_HAS_XL9555
     ESP_ERROR_CHECK(esp_io_expander_new_i2c_xl9555(i2c_bus, XL9555_I2C_ADDR, &expander));
+#endif
 
-    ESP_ERROR_CHECK(lcd_jd9365_init(&s_lcd, expander));
-    ESP_ERROR_CHECK(lcd_backlight_init());
-    ESP_ERROR_CHECK(lcd_backlight_set_brightness(30));
-    ESP_ERROR_CHECK(touch_init(&s_touch, i2c_bus, expander));
+    ESP_ERROR_CHECK(display_panel_init(&s_lcd, expander));
+    ESP_ERROR_CHECK(display_panel_backlight_init());
+    ESP_ERROR_CHECK(display_panel_set_brightness(30));
+    ESP_ERROR_CHECK(touch_panel_init(&s_touch, i2c_bus, expander));
 
-    s_lcd_front_framebuffer = lcd_jd9365_get_next_frame_buffer(&s_lcd);
+    s_lcd_front_framebuffer = display_panel_get_next_frame_buffer(&s_lcd);
     ESP_ERROR_CHECK(s_lcd_front_framebuffer == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     s_lcd_back_framebuffer = (s_lcd_front_framebuffer == s_lcd.frame_buffers[0]) ?
                              s_lcd.frame_buffers[1] : s_lcd.frame_buffers[0];
@@ -490,7 +496,8 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_cache_msync(s_lcd_back_framebuffer,
                                     lcd_framebuffer_size(),
                                     ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED));
-    ESP_ERROR_CHECK(lcd_jd9365_draw_bitmap(&s_lcd, 0, 0, LCD_H_RES, LCD_V_RES, s_lcd_front_framebuffer));
+    ESP_ERROR_CHECK(display_panel_draw_bitmap(&s_lcd, 0, 0, DISPLAY_PANEL_H_RES,
+                                              DISPLAY_PANEL_V_RES, s_lcd_front_framebuffer));
 
     ESP_ERROR_CHECK(lvgl_port_init());
 

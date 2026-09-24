@@ -1,6 +1,8 @@
 #ifndef ESP32P4_HAL_H
 #define ESP32P4_HAL_H
 
+#include <inttypes.h>
+
 // include RadioLib
 #include <RadioLib.h>
 
@@ -82,6 +84,8 @@ class Esp32p4Hal : public RadioLibHal {
         return;
       }
 
+      const gpio_num_t gpio = (gpio_num_t)interruptNum;
+
       if(!s_gpio_isr_service_ready) {
         esp_err_t err = gpio_install_isr_service((int)ESP_INTR_FLAG_IRAM);
         if((err == ESP_OK) || (err == ESP_ERR_INVALID_STATE)) {
@@ -91,8 +95,34 @@ class Esp32p4Hal : public RadioLibHal {
           return;
         }
       }
-      gpio_set_intr_type((gpio_num_t)interruptNum, (gpio_int_type_t)(mode & 0x7));
-      gpio_isr_handler_add((gpio_num_t)interruptNum, (void (*)(void*))interruptCb, NULL);
+
+      esp_err_t err = gpio_set_direction(gpio, GPIO_MODE_INPUT);
+      if(err != ESP_OK) {
+        ESP_LOGE(TAG_HAL, "GPIO%" PRIu32 " input configuration failed: %s",
+                 interruptNum, esp_err_to_name(err));
+        return;
+      }
+
+      const gpio_int_type_t intrType = (gpio_int_type_t)(mode & 0x7);
+      err = gpio_set_intr_type(gpio, intrType);
+      if(err != ESP_OK) {
+        ESP_LOGE(TAG_HAL, "GPIO%" PRIu32 " interrupt type configuration failed: %s",
+                 interruptNum, esp_err_to_name(err));
+        return;
+      }
+
+      err = gpio_isr_handler_add(gpio, (void (*)(void*))interruptCb, NULL);
+      if(err != ESP_OK) {
+        ESP_LOGE(TAG_HAL, "GPIO%" PRIu32 " ISR registration failed: %s",
+                 interruptNum, esp_err_to_name(err));
+        return;
+      }
+
+      ESP_LOGI(TAG_HAL, "GPIO%" PRIu32 " ISR attached, edge=%s, level=%d",
+               interruptNum,
+               intrType == GPIO_INTR_POSEDGE ? "rising" :
+               intrType == GPIO_INTR_NEGEDGE ? "falling" : "other",
+               gpio_get_level(gpio));
     }
 
     void detachInterrupt(uint32_t interruptNum) override {

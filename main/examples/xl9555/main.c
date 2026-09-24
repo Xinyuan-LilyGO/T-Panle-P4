@@ -5,7 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "T_Panle_P4_board_config.h"
+#include "board_config.h"
 #include "driver/i2c_master.h"
 #include "esp_io_expander.h"
 #include "esp_io_expander_xl9555.h"

@@ -18,11 +18,13 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#include "T_Panle_P4_board_config.h"
+#include "board_config.h"
 #include "driver/i2c_master.h"
 #include "esp_ldo_regulator.h"
 #include "esp_io_expander.h"
+#if CONFIG_T_PANEL_P4_HAS_XL9555
 #include "esp_io_expander_xl9555.h"
+#endif
 #include "sgm38121.h"
 
 #include "driver/isp.h"
@@ -31,7 +33,7 @@
 #include "esp_cam_sensor.h"
 #include "esp_sccb_i2c.h"
 #include "ov2710.h"
-#include "lcd_jd9365_driver.h"
+#include "display_panel.h"
 
 static const char *TAG = "camera_example";
 
@@ -48,7 +50,7 @@ static const char *TAG = "camera_example";
 #define CAM_FRAME_LOG_INTERVAL 25
 #define CAM_LCD_PREVIEW 1
 #define CAM_LCD_TARGET_FPS 25
-#define CAM_LCD_CONVERT_YIELD_LINES LCD_V_RES
+#define CAM_LCD_CONVERT_YIELD_LINES DISPLAY_PANEL_V_RES
 #define CAM_LCD_FAST_PREVIEW 1
 #define CAM_LCD_FAST_PREVIEW_SCALE 2
 #define CAM_YIELD_TICKS 1
@@ -66,7 +68,7 @@ static const char *TAG = "camera_example";
 static sgm38121_handle_t pmic;
 static esp_io_expander_handle_t expander = NULL;
 static esp_ldo_channel_handle_t ldo_mipi_phy = NULL;
-static lcd_driver_t lcd = {};
+static display_panel_t lcd = {};
 
 static esp_cam_ctlr_handle_t cam_ctlr = NULL;
 static isp_proc_handle_t isp_proc = NULL;
@@ -88,8 +90,8 @@ static uint8_t *lcd_framebuffer = NULL;
 static size_t lcd_framebuffer_size = 0;
 static int64_t next_lcd_frame_time_us = 0;
 static uint32_t lcd_frame_interval_us = 0;
-static uint16_t lcd_src_x_map[LCD_H_RES] = {};
-static uint16_t lcd_src_y_map[LCD_V_RES] = {};
+static uint16_t lcd_src_x_map[DISPLAY_PANEL_H_RES] = {};
+static uint16_t lcd_src_y_map[DISPLAY_PANEL_V_RES] = {};
 static TaskHandle_t lcd_preview_task_handle = NULL;
 static portMUX_TYPE lcd_preview_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile const uint8_t *lcd_preview_frame = NULL;
@@ -216,9 +218,9 @@ static void convert_raw10_bggr_to_lcd_rgb888(const uint8_t *src, uint8_t *dst)
 
 #if CAM_LCD_FAST_PREVIEW
     const uint32_t scale = CAM_LCD_FAST_PREVIEW_SCALE;
-    for (uint32_t y = 0; y < LCD_V_RES; y += scale) {
+    for (uint32_t y = 0; y < DISPLAY_PANEL_V_RES; y += scale) {
         uint32_t src_y = lcd_src_y_map[y];
-        for (uint32_t x = 0; x < LCD_H_RES; x += scale) {
+        for (uint32_t x = 0; x < DISPLAY_PANEL_H_RES; x += scale) {
             uint32_t src_x = lcd_src_x_map[x];
             uint8_t b = get_raw10_msb8_pixel(src, src_w, src_x, src_y);
             uint8_t g0 = get_raw10_msb8_pixel(src, src_w, src_x + 1, src_y);
@@ -227,7 +229,7 @@ static void convert_raw10_bggr_to_lcd_rgb888(const uint8_t *src, uint8_t *dst)
             uint8_t g = (uint8_t)(((uint16_t)g0 + g1) >> 1);
 
             for (uint32_t yy = 0; yy < scale; yy++) {
-                uint8_t *p = dst + ((size_t)(y + yy) * LCD_H_RES + x) * 3;
+                uint8_t *p = dst + ((size_t)(y + yy) * DISPLAY_PANEL_H_RES + x) * 3;
                 for (uint32_t xx = 0; xx < scale; xx++) {
                     p[0] = b;
                     p[1] = g;
@@ -238,16 +240,16 @@ static void convert_raw10_bggr_to_lcd_rgb888(const uint8_t *src, uint8_t *dst)
         }
     }
 #else
-    for (uint32_t y = 0; y < LCD_V_RES; y++) {
+    for (uint32_t y = 0; y < DISPLAY_PANEL_V_RES; y++) {
         uint32_t src_y = lcd_src_y_map[y];
-        for (uint32_t x = 0; x < LCD_H_RES; x++) {
+        for (uint32_t x = 0; x < DISPLAY_PANEL_H_RES; x++) {
             uint32_t src_x = lcd_src_x_map[x];
             uint8_t b = get_raw10_msb8_pixel(src, src_w, src_x, src_y);
             uint8_t g0 = get_raw10_msb8_pixel(src, src_w, src_x + 1, src_y);
             uint8_t g1 = get_raw10_msb8_pixel(src, src_w, src_x, src_y + 1);
             uint8_t r = get_raw10_msb8_pixel(src, src_w, src_x + 1, src_y + 1);
             uint8_t g = (uint8_t)(((uint16_t)g0 + g1) >> 1);
-            uint8_t *p = dst + ((size_t)y * LCD_H_RES + x) * 3;
+            uint8_t *p = dst + ((size_t)y * DISPLAY_PANEL_H_RES + x) * 3;
             p[0] = b;
             p[1] = g;
             p[2] = r;
@@ -259,10 +261,10 @@ static void convert_raw10_bggr_to_lcd_rgb888(const uint8_t *src, uint8_t *dst)
 #endif
 
     // Hide unstable edge pixels at the LCD boundary and make sure the DPI DMA sees CPU writes.
-    if (LCD_V_RES > 1) {
-        uint8_t *last_line = dst + ((size_t)(LCD_V_RES - 1) * LCD_H_RES * 3);
-        const uint8_t *prev_line = dst + ((size_t)(LCD_V_RES - 2) * LCD_H_RES * 3);
-        memcpy(last_line, prev_line, LCD_H_RES * 3);
+    if (DISPLAY_PANEL_V_RES > 1) {
+        uint8_t *last_line = dst + ((size_t)(DISPLAY_PANEL_V_RES - 1) * DISPLAY_PANEL_H_RES * 3);
+        const uint8_t *prev_line = dst + ((size_t)(DISPLAY_PANEL_V_RES - 2) * DISPLAY_PANEL_H_RES * 3);
+        memcpy(last_line, prev_line, DISPLAY_PANEL_H_RES * 3);
     }
     esp_cache_msync(dst, lcd_framebuffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 }
@@ -274,11 +276,11 @@ static void init_lcd_preview_maps(void)
     const uint32_t crop = src_h;
     const uint32_t crop_x = (src_w - crop) / 2;
 
-    for (uint32_t x = 0; x < LCD_H_RES; x++) {
-        lcd_src_x_map[x] = (uint16_t)((crop_x + (uint32_t)(((uint64_t)x * crop) / LCD_H_RES)) & ~1U);
+    for (uint32_t x = 0; x < DISPLAY_PANEL_H_RES; x++) {
+        lcd_src_x_map[x] = (uint16_t)((crop_x + (uint32_t)(((uint64_t)x * crop) / DISPLAY_PANEL_H_RES)) & ~1U);
     }
-    for (uint32_t y = 0; y < LCD_V_RES; y++) {
-        lcd_src_y_map[y] = (uint16_t)(((uint64_t)y * crop) / LCD_V_RES) & ~1U;
+    for (uint32_t y = 0; y < DISPLAY_PANEL_V_RES; y++) {
+        lcd_src_y_map[y] = (uint16_t)(((uint64_t)y * crop) / DISPLAY_PANEL_V_RES) & ~1U;
     }
 }
 
@@ -336,10 +338,11 @@ static void lcd_preview_task(void *arg)
             continue;
         }
 
-        lcd_framebuffer = lcd_jd9365_get_next_frame_buffer(&lcd);
+        lcd_framebuffer = display_panel_get_next_frame_buffer(&lcd);
         convert_raw10_bggr_to_lcd_rgb888(src, lcd_framebuffer);
         lcd_preview_release_frame(src);
-        esp_err_t ret = lcd_jd9365_draw_bitmap(&lcd, 0, 0, LCD_H_RES, LCD_V_RES, lcd_framebuffer);
+        esp_err_t ret = display_panel_draw_bitmap(&lcd, 0, 0, DISPLAY_PANEL_H_RES,
+                                                  DISPLAY_PANEL_V_RES, lcd_framebuffer);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "LCD draw failed: %s", esp_err_to_name(ret));
         }
@@ -350,14 +353,14 @@ static void lcd_preview_task(void *arg)
 
 static esp_err_t init_lcd_preview(void)
 {
-    lcd_framebuffer_size = LCD_H_RES * LCD_V_RES * (LCD_BIT_PER_PIXEL / 8);
-    ESP_RETURN_ON_ERROR(lcd_jd9365_init(&lcd, expander), TAG, "LCD init failed");
-    lcd_framebuffer = lcd_jd9365_get_next_frame_buffer(&lcd);
+    lcd_framebuffer_size = DISPLAY_PANEL_H_RES * DISPLAY_PANEL_V_RES * (DISPLAY_PANEL_BITS_PER_PIXEL / 8);
+    ESP_RETURN_ON_ERROR(display_panel_init(&lcd, expander), TAG, "LCD init failed");
+    lcd_framebuffer = display_panel_get_next_frame_buffer(&lcd);
     ESP_RETURN_ON_FALSE(lcd_framebuffer, ESP_ERR_NO_MEM, TAG, "Failed to get LCD framebuffer");
-    ESP_RETURN_ON_ERROR(lcd_backlight_init(), TAG, "LCD backlight init failed");
-    ESP_RETURN_ON_ERROR(lcd_backlight_set_brightness(60), TAG, "LCD backlight set failed");
+    ESP_RETURN_ON_ERROR(display_panel_backlight_init(), TAG, "LCD backlight init failed");
+    ESP_RETURN_ON_ERROR(display_panel_set_brightness(60), TAG, "LCD backlight set failed");
     ESP_LOGI(TAG, "LCD preview buffer ready: %ux%u, %u bytes",
-             LCD_H_RES, LCD_V_RES, (unsigned)lcd_framebuffer_size);
+             DISPLAY_PANEL_H_RES, DISPLAY_PANEL_V_RES, (unsigned)lcd_framebuffer_size);
 
     lcd_frame_interval_us = 1000000 / CAM_LCD_TARGET_FPS;
     next_lcd_frame_time_us = esp_timer_get_time();
@@ -601,7 +604,9 @@ void app_main(void)
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &i2c_bus));
 
     ESP_ERROR_CHECK(init_sgm38121(i2c_bus));
+#if CONFIG_T_PANEL_P4_HAS_XL9555
     ESP_ERROR_CHECK(esp_io_expander_new_i2c_xl9555(i2c_bus, XL9555_I2C_ADDR, &expander));
+#endif
 
     ESP_ERROR_CHECK(init_camera_sensor(i2c_bus));
     ESP_ERROR_CHECK(init_mipi_csi_phy_ldo());

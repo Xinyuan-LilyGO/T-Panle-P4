@@ -1,0 +1,3 @@
+dependencies:
+  espressif/esp_cam_sensor:
+    version: "2.3.0"

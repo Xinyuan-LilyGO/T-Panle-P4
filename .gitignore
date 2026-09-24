@@ -1,7 +1,9 @@
 build
 vscode/*
-.claude/*
+.claude
+.codex
 .agents/*
 .devcontainer/*
 git_ignore/*
 managed_components/*
+tmp
